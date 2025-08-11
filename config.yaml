@@ -1,0 +1,57 @@
+# Drop Allocator Configuration
+
+# Default allocation parameters
+allocation:
+  default_k: 5 # Default allocations per user
+  default_timeout: 300 # Default solver timeout in seconds
+  default_seed: 42 # Default random seed
+
+# Solver settings
+solver:
+  default: 'ortools' # Default solver backend
+  ortools:
+    workers: 4 # Number of worker threads
+    log_search: false # Enable search logging
+    max_memory_mb: 2048 # Maximum memory usage
+  pulp:
+    max_time: 300 # Maximum solve time
+    gap_rel: 0.01 # Relative optimality gap
+
+# Coverage optimization
+coverage:
+  default_mode: 'z' # Default coverage mode
+  default_weight: '1.0' # Default coverage weight
+  shortfall_penalty: 100.0 # Penalty for coverage shortfall
+
+# Data processing
+data:
+  min_score: 0.001 # Minimum score threshold
+  top_n: 0 # Top-N filtering (0 = disabled)
+  unsponsored_cap: 100 # Default capacity for unsponsored contracts
+
+# Output settings
+output:
+  format: 'csv' # Output format
+  include_scores: true # Include scores in output
+  include_metadata: true # Include solution metadata
+
+# Database connections
+database:
+  clickhouse:
+    host: 'localhost'
+    port: 9000
+    database: 'default'
+    user: 'default'
+    password: ''
+  postgres:
+    host: 'localhost'
+    port: 5432
+    database: 'postgres'
+    user: 'postgres'
+    password: ''
+
+# Logging
+logging:
+  level: 'INFO'
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  file: null # Log file path (null = console only)

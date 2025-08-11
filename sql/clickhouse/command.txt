@@ -1,0 +1,25 @@
+# ── choose the window you want ──────────────────────────────────────────────
+ST="2025-08-14 15:00:00"
+ET="2025-08-15 07:00:00"
+
+# ── run the query ───────────────────────────────────────────────────────────
+clickhouse-client --secure \
+  -h "$CH_HOST" -u "$CH_USER" --password "$CH_PASS" \
+  --query "
+  SELECT  DISTINCT
+          uce.user_id,
+          uce.contract_address,
+          COALESCE(ubr.score, 0.0001) AS score
+  FROM    public_user_contract_eligibility AS uce
+  INNER   JOIN public_contract              AS c
+             ON c.address = uce.contract_address
+  LEFT    JOIN public_user_brand_recommendation AS ubr
+             ON ubr.user_id = uce.user_id
+            AND ubr.brand_id = c.brand_id
+  WHERE   uce.is_eligible = 1
+    AND   c.is_drop       = 1
+    AND   c.start_datetime <= toDateTime('$ET', 'UTC')
+    AND   c.end_datetime   >= toDateTime('$ST', 'UTC')
+  FORMAT  CSVWithNames
+  " \
+  > elig_pairs_2121.csv
