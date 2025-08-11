@@ -1,0 +1,168 @@
+Here’s a full structured summary of our work so far, plus the relevant SQL/commands you’ll want to carry forward into a new thread so you can start fresh without losing context.
+
+Step 1 – Summary of the Old Conversation
+Goal / Problem
+We’re building and tuning a POC for assignment allocation (drop offers to users) using eligibility pairs, contract caps, and an ILP solver (PuLP or OR-Tools). The two big targets:
+
+Improve runtime – avoid multi-hour solves when the elig table explodes in size.
+
+Improve quality – higher fill rate (≥95% of users get 3 contracts) and higher sponsored share, without blowing through caps.
+
+Key Facts & Assumptions
+Caps source: Postgres query (provided) calculates cap_face using budget, outstanding coupons, and Wilson upper bound on redemption rate.
+
+Eligibility source: ClickHouse query filtered by drop window and ranked by score (row_number() per user).
+
+Past runs:
+
+Top 30 (≈5.1M pairs) → PuLP took ~4h.
+
+Top 20 (≈2.86M pairs) → PuLP ~1.15h, but only ~52% fill rate.
+
+15+15 stratified (~3.63M pairs) → OR-Tools ~2.1h, ~52% fill rate.
+
+~180k eligible users in the window. ~99.8% have at least 1 sponsored contract in eligibility set.
+
+Sponsored caps are low relative to user base → impossible to get >50% sponsored share without increasing caps or adding synthetic unsponsored capacity.
+
+What We Tried / Decided
+Reduced top_n from 30 → 20 → stratified 15+15 split (sponsored + unsponsored).
+
+Switched solver: PuLP → OR-Tools for faster runs.
+
+Adjusted unsponsored synthetic cap (10k → goal 20k–30k) to avoid unsponsored bottlenecks.
+
+Added plan to track post-run metrics (offer count distribution, sponsored share, top constrained contracts).
+
+Tested allocator_cov.py for coverage weighting, but it either greedy-fallbacked or was killed due to memory constraints.
+
+Unresolved Questions
+Feasibility: With current caps, is ≥95% full assignment possible? (Likely no unless caps or unsponsored capacity increase.)
+
+Capacity modeling: Are redemption rates being applied correctly in solver vs. only in cap precomputation?
+
+Solver tuning: Coverage-weighted solve currently fails on large datasets—may need eligibility trimming or more memory.
+
+Step 2 – Context to Carry Over
+Important Queries
+Eligibility – top 20 contracts per user
+
+sql
+Copy
+Edit
+SELECT
+    t.user_id,
+    t.contract_address,
+    t.score
+FROM
+(
+    SELECT
+        uce.user_id,
+        uce.contract_address,
+        COALESCE(ubr.score, 0.0001) AS score,
+        row_number() OVER (
+            PARTITION BY uce.user_id
+            ORDER BY COALESCE(ubr.score, 0.0001) DESC, uce.contract_address
+        ) AS rn
+    FROM public_user_contract_eligibility AS uce
+    INNER JOIN public_contract AS c
+        ON c.address = uce.contract_address
+    LEFT JOIN public_user_brand_recommendation AS ubr
+        ON ubr.user_id = uce.user_id
+        AND ubr.brand_id = c.brand_id
+    WHERE uce.is_eligible = 1
+      AND c.is_drop       = 1
+      AND c.start_datetime <= toDateTime('2025-08-15 07:00:00','UTC')
+      AND c.end_datetime   >= toDateTime('2025-08-14 15:00:00','UTC')
+) AS t
+WHERE t.rn <= 20
+FORMAT CSVWithNames
+Eligibility – stratified 15 sponsored + 15 unsponsored
+
+sql
+Copy
+Edit
+WITH
+    st AS toDateTime('2025-08-14 15:00:00','UTC'),
+    et AS toDateTime('2025-08-15 07:00:00','UTC')
+SELECT user_id, contract_address, score
+FROM (
+    SELECT *,
+           row_number() OVER (PARTITION BY user_id ORDER BY score DESC, contract_address) AS rn
+    FROM (
+        SELECT uce.user_id,
+               uce.contract_address,
+               COALESCE(ubr.score, 0.0001) AS score
+        FROM public_user_contract_eligibility AS uce
+        INNER JOIN public_contract AS c ON c.address = uce.contract_address
+        LEFT JOIN public_user_brand_recommendation AS ubr
+            ON ubr.user_id = uce.user_id
+           AND ubr.brand_id = c.brand_id
+        WHERE uce.is_eligible = 1
+          AND c.is_drop = 1
+          AND c.start_datetime <= et
+          AND c.end_datetime >= st
+          AND c.is_sponsored = 1
+    ) spon
+) spon_top
+WHERE rn <= 15
+
+UNION ALL
+
+SELECT user_id, contract_address, score
+FROM (
+    SELECT *,
+           row_number() OVER (PARTITION BY user_id ORDER BY score DESC, contract_address) AS rn
+    FROM (
+        SELECT uce.user_id,
+               uce.contract_address,
+               COALESCE(ubr.score, 0.0001) AS score
+        FROM public_user_contract_eligibility AS uce
+        INNER JOIN public_contract AS c ON c.address = uce.contract_address
+        LEFT JOIN public_user_brand_recommendation AS ubr
+            ON ubr.user_id = uce.user_id
+           AND ubr.brand_id = c.brand_id
+        WHERE uce.is_eligible = 1
+          AND c.is_drop = 1
+          AND c.start_datetime <= et
+          AND c.end_datetime >= st
+          AND (c.is_sponsored = 0 OR c.is_sponsored IS NULL)
+    ) unspon
+) unspon_top
+WHERE rn <= 15
+FORMAT CSVWithNames
+Post-run report
+
+bash
+Copy
+Edit
+python3 report.py \
+  --caps contract_caps_2121.csv \
+  --assign drop_assignments_2121_top30_or.csv \
+  --elig elig_pairs_2121_top30_strat.csv \
+  -k 3
+Key Run Commands
+OR-Tools run (stratified, high unsponsored cap):
+
+bash
+Copy
+Edit
+python allocator.py \
+  --caps contract_caps_2121.csv \
+  --elig elig_pairs_2121_top30_strat.csv \
+  --out drop_assignments_2121_top30_or.csv \
+  -k 3 \
+  --unsponsored_cap 30000 \
+  --timeout 7200 \
+  --solver or \
+  --or_workers 8
+Step 3 – Current State of the POC
+Solver works reliably with OR-Tools for large runs, but coverage-weighted variant is unstable for big elig sets.
+
+Sponsored capacity is the limiting factor — most users (~50%) end up with 0 offers because of caps.
+
+Raising synthetic unsponsored caps helps prevent bottlenecks there, but doesn’t solve sponsored share limits.
+
+Next steps would be eligibility trimming + capacity expansion if we want higher fill and sponsored ratio.
+
+Do you want me to also prepare a clean restart runbook with file naming conventions so you can execute the next run without mixing inputs/outputs? That way you can jump in fresh and avoid the slow lag from this long conversation.
