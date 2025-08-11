@@ -183,3 +183,22 @@ temp_*
 *.out
 data/*.csv
 sql/clickhouse/*.csv
+
+# Large data files
+data/*.csv
+sql/clickhouse/*.csv
+*.csv
+temp_*.csv
+elig_pairs_*.csv
+drop_assignments_*.csv
+contract_caps_*.csv
+
+# Virtual environments
+venv/
+venv311/
+.venv/
+
+# Output files
+outputs/
+*.out
+*.log
