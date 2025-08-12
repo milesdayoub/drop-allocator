@@ -9,8 +9,8 @@ scope AS (                        -- contracts visible in this window
         COALESCE(NULLIF(c.price,0), c.max_value, 0)::numeric AS face_value
     FROM   contract c
     WHERE  c.is_drop = TRUE
-      AND  c.start_datetime <= TIMESTAMPTZ '2025-08-15 07:00:00+00'
-      AND  c.end_datetime   >= TIMESTAMPTZ '2025-08-14 15:00:00+00'
+      AND  c.start_datetime <= TIMESTAMPTZ '2025-08-14 15:00:00+00'
+      AND  c.end_datetime   >= TIMESTAMPTZ '2025-08-15 07:00:00+00'
       AND  c.address NOT IN (
             SELECT contract_address
             FROM   timed_drop_excluded_contract
