@@ -39,8 +39,7 @@ def _to_int(s):
     return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
 
 
-def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsored_cap, top_n, min_score):
-    # Load contract caps
+def load_inputs(caps_csv, elig_csv, unsponsored_cap, top_n, min_score):
     caps = (pd.read_csv(caps_csv, dtype={'contract_address': str})
               .rename(columns=str.strip))
     if 'is_sponsored' not in caps.columns:
@@ -55,42 +54,17 @@ def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsor
               .drop_duplicates('contract_address')
               .reset_index(drop=True))
 
-    # Load user-group mapping
-    user_groups = (pd.read_csv(user_groups_csv, dtype={'user_id': str, 'group_id': str})
-                     .rename(columns=str.strip)
-                     .drop_duplicates('user_id'))
-    
-    # Load group sponsorship ratios
-    group_ratios = (pd.read_csv(group_ratios_csv, dtype={'group_id': str})
-                      .rename(columns=str.strip)
-                      .drop_duplicates('group_id'))
-    
-    # Validate required columns
-    need_caps = {'contract_address', 'cap_face', 'is_sponsored'}
-    need_user_groups = {'user_id', 'group_id'}
-    need_group_ratios = {'group_id', 'sponsorship_ratio'}
-    
-    if (m := need_caps - set(caps.columns)):
-        raise ValueError(f"caps missing {m}")
-    if (m := need_user_groups - set(user_groups.columns)):
-        raise ValueError(f"user_groups missing {m}")
-    if (m := need_group_ratios - set(group_ratios.columns)):
-        raise ValueError(f"group_ratios missing {m}")
-
-    # Load eligibility pairs
     elig = (pd.read_csv(elig_csv, dtype={'contract_address': str, 'user_id': str})
               .rename(columns=str.strip)
               .drop_duplicates(['user_id', 'contract_address']))
 
+    need_caps = {'contract_address', 'cap_face', 'is_sponsored'}
     need_elig = {'user_id', 'contract_address', 'score'}
+    if (m := need_caps - set(caps.columns)):
+        raise ValueError(f"caps missing {m}")
     if (m := need_elig - set(elig.columns)):
         raise ValueError(f"elig missing {m}")
 
-    # CRITICAL: Filter eligibility to only users who belong to drop-eligible groups
-    print(f"Before user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
-    elig = elig[elig.user_id.isin(user_groups.user_id)]
-    print(f"After user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
-    
     # Keep only contracts with positive cap after synthetic fill
     elig = elig[elig.contract_address.isin(caps.contract_address)]
 
@@ -104,27 +78,7 @@ def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsor
                     .groupby('user_id', sort=False)
                     .head(top_n)
                     .reset_index(drop=True))
-    
-    # Add contract sponsorship information to eligibility pairs
-    caps_sponsorship = caps[['contract_address', 'is_sponsored']].copy()
-    elig = elig.merge(caps_sponsorship, on='contract_address', how='left')
-    
-    # Add group information to eligibility pairs for constraint building
-    elig = elig.merge(user_groups[['user_id', 'group_id']], on='user_id', how='left')
-    
-    # Add sponsorship ratio information
-    elig = elig.merge(group_ratios[['group_id', 'sponsorship_ratio']], on='group_id', how='left')
-    
-    # Validate all users have group and ratio information
-    missing_groups = elig[elig['group_id'].isna()]
-    if not missing_groups.empty:
-        raise ValueError(f"Found {len(missing_groups)} elig pairs with missing group_id")
-    
-    missing_ratios = elig[elig['sponsorship_ratio'].isna()]
-    if not missing_ratios.empty:
-        raise ValueError(f"Found {len(missing_ratios)} elig pairs with missing sponsorship_ratio")
-    
-    return caps.reset_index(drop=True), elig.reset_index(drop=True), user_groups.reset_index(drop=True), group_ratios.reset_index(drop=True)
+    return caps.reset_index(drop=True), elig.reset_index(drop=True)
 
 
 def summarize(df_assign: pd.DataFrame, elig: pd.DataFrame, k: int):
@@ -135,59 +89,6 @@ def summarize(df_assign: pd.DataFrame, elig: pd.DataFrame, k: int):
     return {'n_users': int(len(users)),
             'dist': {int(i): int(dist[i]) for i in dist},
             'fill_rate': float(fill)}
-
-
-def validate_sponsorship_ratios(df_assign, elig, group_ratios):
-    """Validate that sponsorship ratios are enforced correctly."""
-    if df_assign.empty:
-        return
-    
-    print("\n=== SPONSORSHIP RATIO VALIDATION ===")
-    
-    # Add group and sponsorship info to assignments
-    # Note: Both df_assign and elig have 'is_sponsored', 'group_id', 'sponsorship_ratio' columns
-    # so we need to handle the merge carefully to avoid column conflicts
-    df_with_groups = df_assign.merge(
-        elig[['user_id', 'contract_address', 'group_id', 'sponsorship_ratio', 'is_sponsored']], 
-        on=['user_id', 'contract_address'], 
-        how='left',
-        suffixes=('', '_elig')
-    )
-    
-    # Use the original columns from assignments (they should be identical to elig anyway)
-    # but if there are any mismatches, we'll see them in validation
-    
-    # Check per-user sponsorship uniformity
-    user_sponsorship_types = df_with_groups.groupby('user_id')['is_sponsored'].agg(['nunique', 'first'])
-    mixed_users = user_sponsorship_types[user_sponsorship_types['nunique'] > 1]
-    
-    if not mixed_users.empty:
-        print(f"❌ VIOLATION: {len(mixed_users)} users have mixed sponsorship types!")
-        print(mixed_users.head())
-    else:
-        print("✅ All users have uniform sponsorship types")
-    
-    # Check group-level sponsorship ratios
-    group_stats = df_with_groups.groupby('group_id').agg({
-        'user_id': 'nunique',
-        'is_sponsored': lambda x: (x == True).sum() if len(x) > 0 else 0,
-        'sponsorship_ratio': 'first'
-    }).rename(columns={'user_id': 'total_users', 'is_sponsored': 'sponsored_users'})
-    
-    group_stats['actual_ratio'] = group_stats['sponsored_users'] / group_stats['total_users']
-    group_stats['expected_max_sponsored'] = (group_stats['total_users'] * group_stats['sponsorship_ratio']).astype(int)
-    group_stats['ratio_violation'] = group_stats['sponsored_users'] > group_stats['expected_max_sponsored']
-    
-    violations = group_stats[group_stats['ratio_violation']]
-    if not violations.empty:
-        print(f"❌ RATIO VIOLATIONS in {len(violations)} groups:")
-        print(violations[['total_users', 'sponsored_users', 'expected_max_sponsored', 'sponsorship_ratio', 'actual_ratio']])
-    else:
-        print("✅ All groups respect sponsorship ratio constraints")
-    
-    # Summary by group
-    print("\nGroup Summary:")
-    print(group_stats[['total_users', 'sponsored_users', 'expected_max_sponsored', 'sponsorship_ratio', 'actual_ratio']].round(3))
 
 
 def print_summary(df_assign, caps, elig, k, label, t_sec):
@@ -207,11 +108,6 @@ def print_summary(df_assign, caps, elig, k, label, t_sec):
         wall time         : {t_sec:.1f}s
         ──────────────────────────────────────────────────────────
     """).strip())
-    
-    # Validate sponsorship ratios if group data is available
-    if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
-        group_ratios = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
-        validate_sponsorship_ratios(df_assign, elig, group_ratios)
 
 
 def greedy(caps, elig, k, seed=42):
@@ -354,57 +250,6 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
         addr = str(cid_cat.categories[cc])
         m.Add(LSum([x[i] for i in idx]) <= int(cap_vec[addr]))
 
-    # SPONSORSHIP RATIO CONSTRAINTS
-    # Create y[u] variables: 1 if user u gets sponsored contracts, 0 if non-sponsored
-    y_user = {}
-    for uc in range(len(uid_cat.categories)):
-        user_id = str(uid_cat.categories[uc])
-        y_user[uc] = m.NewBoolVar(f"y_user_{user_id}")
-    
-    # Sponsorship uniformity constraints: if x[i]=1, then user's sponsorship type must match contract's
-    for i in range(len(elig)):
-        uc = uid_cat.codes[i]  # user category index
-        is_sponsored = elig.iloc[i]['is_sponsored']
-        
-        if pd.isna(is_sponsored):
-            raise ValueError(f"Missing is_sponsored for elig row {i}")
-            
-        # Convert is_sponsored to boolean
-        is_sponsored_bool = is_sponsored in [True, 1, '1', 'true', 'True', 't', 'T']
-        
-        if is_sponsored_bool:
-            # If contract is sponsored, user must be in sponsored group: x[i] ≤ y[uc]
-            m.Add(x[i] <= y_user[uc])
-        else:
-            # If contract is non-sponsored, user must NOT be in sponsored group: x[i] ≤ (1 - y[uc])
-            m.Add(x[i] <= (1 - y_user[uc]))
-    
-    # Group sponsorship ratio constraints
-    # Group users by their group_id and enforce ratio constraints
-    group_users = elig.groupby('group_id')['user_id'].apply(lambda x: x.unique()).to_dict()
-    group_ratios_dict = elig.groupby('group_id')['sponsorship_ratio'].first().to_dict()
-    
-    for group_id, users_in_group in group_users.items():
-        ratio = float(group_ratios_dict[group_id])
-        
-        # Find user category indices for this group
-        group_user_cats = []
-        for user_id in users_in_group:
-            try:
-                uc = uid_cat.categories.get_loc(user_id)
-                group_user_cats.append(uc)
-            except KeyError:
-                # User not in current elig data (filtered out), skip
-                continue
-        
-        if group_user_cats:
-            # Sum of sponsored users in group ≤ group_size * ratio
-            group_size = len(group_user_cats)
-            max_sponsored = int(group_size * ratio)
-            m.Add(LSum([y_user[uc] for uc in group_user_cats]) <= max_sponsored)
-            
-            print(f"Group {group_id}: {group_size} users, ratio={ratio:.2f}, max_sponsored={max_sponsored}")
-
     # objective terms
     scores = (elig.score * 1_000_000).astype(int).to_numpy()
     obj_terms = [scores[i] * x[i] for i in range(len(elig))]
@@ -458,12 +303,8 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
 
 def main(cfg):
     t0 = time.time()
-    caps, elig, user_groups, group_ratios = load_inputs(
-        cfg.caps, cfg.elig, cfg.user_groups, cfg.group_ratios, 
-        cfg.unsponsored_cap, cfg.top_n, cfg.min_score
-    )
+    caps, elig = load_inputs(cfg.caps, cfg.elig, cfg.unsponsored_cap, cfg.top_n, cfg.min_score)
     print(f"caps: {len(caps):,}   elig pairs: {len(elig):,}")
-    print(f"groups: {len(group_ratios):,}   users with groups: {len(user_groups):,}")
 
     df = None; t_used = 0.0
     if cfg.solver in ("pulp", "both"):
@@ -493,8 +334,6 @@ def cli():
     ap = argparse.ArgumentParser()
     ap.add_argument("--caps", required=True)
     ap.add_argument("--elig", required=True)
-    ap.add_argument("--user_groups", required=True)
-    ap.add_argument("--group_ratios", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("-k", type=int, default=3, help="offers per user")
     ap.add_argument("--top_n", type=int, default=0, help="pre-trim per user (0=off)")
