@@ -307,7 +307,7 @@ def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
     # Create fast user lookup structures
     user_to_group = elig.groupby('user_id')['group_id'].first().to_dict()
     # Build per-user top-(cache_factor*k) offers dictionaries (more options for top-up)
-    cache_factor = 3
+    cache_factor = 10
     user_to_sponsored_offers = {uid: grp.nlargest(k * cache_factor, 'score')
                                 for uid, grp in sponsored_elig.groupby('user_id')}
     user_to_unsponsored_offers = {uid: grp.nlargest(k * cache_factor, 'score')
@@ -321,6 +321,9 @@ def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
     # Phase 1: Meet sponsorship ratios (vectorized approach)
     if group_ratios is not None:
         print(f"[greedy] Phase 1: Meeting sponsorship ratios for {len(group_ratios)} groups")
+        # Reserve time budget: dedicate ~40% of total timeout to Phase 1, leaving the rest for Phase 2
+        total_deadline = (start_time + float(timeout)) if timeout else None
+        p1_deadline = (start_time + 0.1*float(timeout)) if timeout else None
         
         # Calculate group targets and current progress
         group_targets = {}
@@ -386,13 +389,13 @@ def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
                         # Skip users with invalid data
                         continue
                 
-                # Check timeout
-                if timeout and (time.time() - start_time) > timeout:
+                # Check timeout (Phase 1 budget)
+                if p1_deadline and time.time() > p1_deadline:
                     print(f"[greedy] Phase 1 timeout reached ({timeout}s), stopping early")
                     break
             
-            # Check timeout after each group
-            if timeout and (time.time() - start_time) > timeout:
+            # Check timeout after each group (Phase 1 budget)
+            if p1_deadline and time.time() > p1_deadline:
                 break
     
     # Phase 2: Top-up all users in rounds to reach k offers, exhausting capacity
@@ -434,7 +437,8 @@ def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
             # stop early if we already filled everything or timed out
             if len(chosen) >= total_possible:
                 break
-            if timeout and (time.time() - start_time) > (timeout):
+            # Phase 2 uses the full remaining time until total deadline
+            if total_deadline and time.time() > total_deadline:
                 print(f"[greedy] Phase 2 timeout reached ({timeout}s), stopping early")
                 break
             # Skip users already at or above this round (e.g., already have >= round_idx offers)
@@ -457,8 +461,10 @@ def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
                         if (uid, row['contract_address']) not in assigned_pairs and remaining.get(row['contract_address'], 0) > 0:
                             best_uns = row
                             break
-                # Choose the better next option by score
-                if best_spon is not None and (best_uns is None or best_spon['score'] >= best_uns['score']):
+                # Choose sponsored when both are viable (small bias toward sponsored)
+                if best_spon is not None and best_uns is not None:
+                    user_sponsorship[uid] = True
+                elif best_spon is not None:
                     user_sponsorship[uid] = True
                 elif best_uns is not None:
                     user_sponsorship[uid] = False
@@ -480,6 +486,71 @@ def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
         # If a full round made no progress, stop to avoid spinning
         if not made_progress:
             break
+
+    # Post top-up sponsored capacity sweep: try to drain remaining sponsored units
+    # Assign to eligible users below k, keeping uniformity and no duplicates
+    if remaining:
+        # Precompute sponsorship map for contracts
+        c_is_spon = caps.set_index('contract_address')['is_sponsored'].to_dict()
+        # Iterate sponsored contracts with remaining capacity
+        for ca, cap_left in list(remaining.items()):
+            if cap_left <= 0:
+                continue
+            if not c_is_spon.get(ca, False):
+                continue  # only sponsored sweep
+            # Candidates: sponsored eligibility rows for this contract, sorted by score
+            cand_df = sponsored_elig[sponsored_elig['contract_address'] == ca]
+            if cand_df.empty:
+                continue
+            for _, offer in cand_df.iterrows():
+                if total_deadline and time.time() > total_deadline:
+                    break
+                if remaining.get(ca, 0) <= 0:
+                    break
+                uid = offer['user_id']
+                # skip users already at k, duplicates, or locked to unsponsored
+                if user_assigned_count.get(uid, 0) >= k:
+                    continue
+                if (uid, ca) in assigned_pairs:
+                    continue
+                if uid in user_sponsorship and user_sponsorship[uid] is False:
+                    continue
+                # ensure user sponsorship is sponsored (uniformity)
+                if uid not in user_sponsorship:
+                    user_sponsorship[uid] = True
+                if try_assign_offer(offer):
+                    # already updated counts/capacity
+                    continue
+
+    # Post top-up unsponsored capacity sweep: drain remaining unsponsored units
+    # Assign to eligible users below k, keeping uniformity and no duplicates
+    if remaining:
+        for ca, cap_left in list(remaining.items()):
+            if cap_left <= 0:
+                continue
+            if c_is_spon.get(ca, False):
+                continue  # only unsponsored sweep here
+            cand_df = unsponsored_elig[unsponsored_elig['contract_address'] == ca]
+            if cand_df.empty:
+                continue
+            for _, offer in cand_df.iterrows():
+                if total_deadline and time.time() > total_deadline:
+                    break
+                if remaining.get(ca, 0) <= 0:
+                    break
+                uid = offer['user_id']
+                # skip users already at k, duplicates, or locked to sponsored
+                if user_assigned_count.get(uid, 0) >= k:
+                    continue
+                if (uid, ca) in assigned_pairs:
+                    continue
+                if uid in user_sponsorship and user_sponsorship[uid] is True:
+                    continue
+                # ensure user sponsorship is unsponsored (uniformity)
+                if uid not in user_sponsorship:
+                    user_sponsorship[uid] = False
+                try_assign_offer(offer)
+        
     
     # Convert to DataFrame and print summary
     result_df = pd.DataFrame(chosen, columns=elig.columns)
@@ -727,7 +798,8 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
         if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
             group_ratios_for_greedy = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
         
-        g = greedy(caps, elig, k, seed=42, group_ratios=group_ratios_for_greedy, timeout=60)
+        # Extend warm-start time to push ratios further before seeding
+        g = greedy(caps, elig, k, seed=42, group_ratios=group_ratios_for_greedy, timeout=150)
         hint_idx = _hint_indices_from_greedy(elig, g)
         _add_hint_compat(m, x, hint_idx)
         print(f"[warm-start] built in {time.time()-t_ws:.1f}s")
@@ -772,7 +844,8 @@ def main(cfg):
         if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
             group_ratios_for_greedy = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
         
-        df = greedy(caps, elig, cfg.k, cfg.rng, group_ratios=group_ratios_for_greedy, timeout=300)
+        # Use full CLI timeout for greedy fallback
+        df = greedy(caps, elig, cfg.k, cfg.rng, group_ratios=group_ratios_for_greedy, timeout=cfg.timeout)
         label = "Greedy"
     else:
         label = "PuLP" if cfg.solver == "pulp" or (cfg.solver == "both" and t_used > 0 and df is not None) else "OR-Tools"
