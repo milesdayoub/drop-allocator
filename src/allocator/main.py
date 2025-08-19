@@ -2,22 +2,40 @@
 """
 Claim – Drop Allocator with coverage encouragement (POC)
 
-• Sponsored caps already include redemption projection (cap_face from PG).
-• Unsponsored synthetic cap via --unsponsored_cap (no redemption modeling).
+What this file contains (no omissions):
+• Input loading, validation, and summaries
+• Greedy solver (enhanced):
+    - Dynamic assignment-level sponsorship ratio guard per group:
+        --enforce_assignment_ratio
+        --assignment_ratio_guard {none,moving,hard}
+        --ratio_slack
+    - Third-slot-only mixing, sponsored-first bias
+    - Per-group cap on mixed users (bug fix from older version)
+    - Per-group cap on "sponsored users" via --max_sponsored_ratio
+    - cache_factor for deeper tail search
+    - NEW: scarcity weighting nudge for under-utilized sponsored contracts:
+        --scarcity_alpha (0..~0.2), effective score = score * (1 + α * remaining/cap)
+• ILP solvers preserved:
+    - PuLP (CBC) path (coverage z_u,t, caps, ≤k per user)
+    - OR-Tools CP-SAT path (caps, ≤k, user-level ratio min, uniformity)
+    - Warm start from Greedy (AddHint), identical to older file (now passes scarcity_alpha)
+• Same reporting: user-level ratio, assignment-level ratio, capacity analysis
 
-Coverage modes:
-  - cov_mode=z          → z_{u,t} coverage vars weighted by --cov_w
-  - cov_mode=shortfall  → per-user shortfall penalty (lighter/faster)
-
-Extras:
-  - Warm start (greedy -> AddHint on CpModel) with cross-version compatibility.
-  - Pre-trim with --top_n and/or --min_score.
-  - Keeps Greedy and PuLP variants for comparison.
+Suggested knobs for your last run:
+  --cache_factor 30 \
+  --mix_tail \
+  --sponsored_first_rounds 2 \
+  --third_slot_only_mixing \
+  --enforce_assignment_ratio \
+  --assignment_ratio_guard hard \
+  --ratio_slack 0.0 \
+  --max_sponsored_ratio 0.98 \
+  --max_mixed_share 0.30 \
+  --scarcity_alpha 0.08
 """
 
 from __future__ import annotations
-import argparse, sys, time, textwrap
-import math
+import argparse, sys, time, textwrap, math
 import pandas as pd, numpy as np
 
 # Optional solvers
@@ -87,7 +105,7 @@ def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsor
     if (m := need_elig - set(elig.columns)):
         raise ValueError(f"elig missing {m}")
 
-    # CRITICAL: Filter eligibility to only users who belong to drop-eligible groups
+    # CRITICAL: Filter to only users with groups
     print(f"Before user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
     elig = elig[elig.user_id.isin(user_groups.user_id)]
     print(f"After user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
@@ -99,31 +117,23 @@ def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsor
     if min_score is not None:
         elig = elig[elig['score'] >= float(min_score)]
 
-    # Optional per-user Top-N before solve (0=off)
-    if top_n and top_n > 0:
-        elig = (elig.sort_values(['user_id', 'score'], ascending=[True, False])
-                    .groupby('user_id', sort=False)
-                    .head(top_n)
-                    .reset_index(drop=True))
+    # Add contract sponsorship information
+    caps_spon = caps[['contract_address', 'is_sponsored']].copy()
+    elig = elig.merge(caps_spon, on='contract_address', how='left')
     
-    # Add contract sponsorship information to eligibility pairs
-    caps_sponsorship = caps[['contract_address', 'is_sponsored']].copy()
-    elig = elig.merge(caps_sponsorship, on='contract_address', how='left')
-    
-    # Add group information to eligibility pairs for constraint building
+    # Add group info
     elig = elig.merge(user_groups[['user_id', 'group_id']], on='user_id', how='left')
     
-    # Add sponsorship ratio information
+    # Add sponsorship ratio by group
     elig = elig.merge(group_ratios[['group_id', 'sponsorship_ratio']], on='group_id', how='left')
     
-    # Validate all users have group and ratio information
-    missing_groups = elig[elig['group_id'].isna()]
-    if not missing_groups.empty:
-        raise ValueError(f"Found {len(missing_groups)} elig pairs with missing group_id")
-    
-    missing_ratios = elig[elig['sponsorship_ratio'].isna()]
-    if not missing_ratios.empty:
-        raise ValueError(f"Found {len(missing_ratios)} elig pairs with missing sponsorship_ratio")
+    # Validate
+    if elig['group_id'].isna().any():
+        missing = elig[elig['group_id'].isna()]
+        raise ValueError(f"Found {len(missing)} elig pairs with missing group_id")
+    if elig['sponsorship_ratio'].isna().any():
+        missing = elig[elig['sponsorship_ratio'].isna()]
+        raise ValueError(f"Found {len(missing)} elig pairs with missing sponsorship_ratio")
     
     return caps.reset_index(drop=True), elig.reset_index(drop=True), user_groups.reset_index(drop=True), group_ratios.reset_index(drop=True)
 
@@ -138,75 +148,13 @@ def summarize(df_assign: pd.DataFrame, elig: pd.DataFrame, k: int):
             'fill_rate': float(fill)}
 
 
-def validate_sponsorship_ratios(df_assign, elig, group_ratios, caps=None):
-    if df_assign.empty:
-        return
-    
-    print("\n=== SPONSORSHIP RATIO VALIDATION ===")
-    
-    # Merge to get group and sponsorship info
-    df = df_assign.merge(
-        elig[['user_id', 'contract_address', 'group_id', 'sponsorship_ratio', 'is_sponsored']], 
-        on=['user_id', 'contract_address'], 
-        how='left',
-        suffixes=('', '_elig'),
-    )
-
-    # 1) Per-user uniformity (no mixed sponsorship)
-    per_user = df.groupby('user_id')['is_sponsored'].agg(['nunique', 'first'])
-    mixed_users = per_user[per_user['nunique'] > 1]
-    if not mixed_users.empty:
-        print(f"❌ VIOLATION: {len(mixed_users)} users have mixed sponsorship types!")
-        print(mixed_users.head())
-    else:
-        print("✅ All users have uniform sponsorship types")
-    
-    # 2) Group-level ratios at USER level (not assignment rows)
-    # For each user in each group: mark if they are a sponsored user
-    user_flag = (
-        df.groupby(['group_id', 'user_id'])['is_sponsored']
-          .agg(lambda s: bool(s.max()))   # "any" sponsored => user is sponsored
-          .rename('user_is_sponsored')
-          .reset_index()
-    )
-
-    group_totals = (
-        user_flag.groupby('group_id')
-                 .agg(total_users=('user_id', 'nunique'),
-                      sponsored_users=('user_is_sponsored', 'sum'))
-                 .reset_index()
-    )
-
-    # Bring in sponsorship_ratio
-    ratios = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
-    group_stats = group_totals.merge(ratios, on='group_id', how='left')
-
-    group_stats['expected_min_sponsored'] = (group_stats['total_users'] * group_stats['sponsorship_ratio']).apply(math.ceil).astype(int)
-    group_stats['actual_ratio'] = group_stats['sponsored_users'] / group_stats['total_users'].clip(lower=1)
-    group_stats['ratio_violation'] = group_stats['sponsored_users'] < group_stats['expected_min_sponsored']
-    
-    violations = group_stats[group_stats['ratio_violation']]
-    if not violations.empty:
-        print(f"❌ RATIO VIOLATIONS in {len(violations)} groups:")
-        print(violations[['total_users', 'sponsored_users', 'expected_min_sponsored', 'sponsorship_ratio', 'actual_ratio']])
-    else:
-        print("✅ All groups respect sponsorship ratio constraints")
-    
-    print("\nGroup Summary:")
-    print(group_stats[['total_users', 'sponsored_users', 'expected_min_sponsored', 'sponsorship_ratio', 'actual_ratio']].round(3))
-    
-    # 3) Capacity analysis if caps provided
-    if caps is not None:
-        analyze_sponsored_capacity(df_assign, caps)
-
-
 def analyze_sponsored_capacity(df_assign, caps):
     """Analyze sponsored contract capacity utilization"""
     print("\n=== SPONSORSHIP CAPACITY ANALYSIS ===")
     
     # Get contract caps for sponsored contracts
     sponsored_caps = caps[caps['is_sponsored'] == True]
-    total_sponsored_cap = sponsored_caps['cap_face'].sum()
+    total_sponsored_cap = int(sponsored_caps['cap_face'].sum())
     
     # Count sponsored assignments by contract
     sponsored_assignments = df_assign[df_assign['is_sponsored'] == True]
@@ -224,7 +172,8 @@ def analyze_sponsored_capacity(df_assign, caps):
     
     print(f"Total sponsored contract capacity: {total_sponsored_cap:,}")
     print(f"Total sponsored assignments made: {len(sponsored_assignments):,}")
-    print(f"Overall sponsored capacity utilization: {len(sponsored_assignments)/total_sponsored_cap*100:.1f}%\n")
+    if total_sponsored_cap > 0:
+        print(f"Overall sponsored capacity utilization: {len(sponsored_assignments)/total_sponsored_cap*100:.1f}%\n")
     
     # Show contracts that are fully utilized
     fully_utilized = capacity_analysis[capacity_analysis['assigned'] >= capacity_analysis['cap_face']]
@@ -250,11 +199,84 @@ def analyze_sponsored_capacity(df_assign, caps):
     print(f"Partially used: {len(remaining_capacity)} contracts") 
     print(f"Unused: {len(unused)} contracts")
     print(f"Total sponsored contracts: {len(sponsored_caps)}")
+
+
+def validate_sponsorship_ratios(df_assign, elig, group_ratios, caps=None):
+    if df_assign.empty:
+        return
     
-    if len(fully_utilized) > 0:
-        print(f"\n🚨 CAPACITY CONSTRAINT: {len(fully_utilized)} sponsored contracts are at 100% capacity!")
-        print("This explains why you can't meet the minimum sponsorship ratios.")
-        print("Consider: reducing ratio targets, adding more sponsored contracts, or using soft constraints.")
+    print("\n=== SPONSORSHIP RATIO VALIDATION ===")
+    
+    # Merge to get group and sponsorship info
+    df = df_assign.merge(
+        elig[['user_id', 'contract_address', 'group_id', 'sponsorship_ratio', 'is_sponsored']], 
+        on=['user_id', 'contract_address'], 
+        how='left',
+        suffixes=('', '_elig'),
+    )
+
+    # 1) Per-user uniformity (diagnostic; may be relaxed by policy)
+    per_user = df.groupby('user_id')['is_sponsored'].agg(['nunique', 'first'])
+    mixed_users = per_user[per_user['nunique'] > 1]
+    if not mixed_users.empty:
+        print(f"❌ VIOLATION: {len(mixed_users)} users have mixed sponsorship types!")
+        print(mixed_users.head())
+    else:
+        print("✅ All users have uniform sponsorship types")
+    
+    # 2) Group-level ratios at USER level (not assignment rows)
+    user_flag = (
+        df.groupby(['group_id', 'user_id'])['is_sponsored']
+          .agg(lambda s: bool(s.max()))   # "any" sponsored => user is sponsored
+          .rename('user_is_sponsored')
+          .reset_index()
+    )
+
+    group_totals = (
+        user_flag.groupby('group_id')
+                 .agg(total_users=('user_id', 'nunique'),
+                      sponsored_users=('user_is_sponsored', 'sum'))
+                 .reset_index()
+    )
+
+    # Bring in sponsorship_ratio
+    ratios = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
+    group_stats = group_totals.merge(ratios, on='group_id', how='left')
+
+    group_stats['expected_min_sponsored'] = (group_stats['total_users'] * group_stats['sponsorship_ratio']).apply(math.ceil).astype(int)
+    group_stats['actual_ratio'] = group_stats['sponsored_users'] / group_stats['total_users'].clip(lower=1)
+    group_stats['ratio_violation'] = group_stats['sponsored_users'] < group_stats['expected_min_sponsored']
+    
+    violations = group_stats[group_stats['ratio_violation']]
+    if not violations.empty:
+        print(f"❌ USER-RATIO VIOLATIONS in {len(violations)} groups:")
+        print(violations[['total_users', 'sponsored_users', 'expected_min_sponsored', 'sponsorship_ratio', 'actual_ratio']])
+    else:
+        print("✅ All groups respect sponsorship ratio constraints")
+    
+    # 3) Assignment-level ratios (sponsored assignments / total assignments) per group
+    df['_spon'] = df['is_sponsored'].astype(bool)
+    assign_summary = (
+        df.groupby('group_id')
+          .agg(total_assignments=('user_id', 'size'),
+               sponsored_assignments=('_spon', 'sum'))
+          .reset_index()
+    )
+    assign_summary = assign_summary.merge(ratios, on='group_id', how='left')
+    assign_summary['assignment_ratio'] = assign_summary['sponsored_assignments'] / assign_summary['total_assignments'].clip(lower=1)
+
+    print("\nAssignments-Level Summary:")
+    print(assign_summary[['total_assignments', 'sponsored_assignments', 'sponsorship_ratio', 'assignment_ratio']].round(3))
+
+    viol = assign_summary[assign_summary['assignment_ratio'] + 1e-12 < assign_summary['sponsorship_ratio']]
+    if not viol.empty:
+        print(f"❌ ASSIGNMENT-RATIO VIOLATIONS in {len(viol):,} groups.")
+    else:
+        print("✅ All groups respect assignments-level sponsorship ratios")
+    
+    # Capacity analysis if caps provided
+    if caps is not None:
+        analyze_sponsored_capacity(df_assign, caps)
 
 
 def print_summary(df_assign, caps, elig, k, label, t_sec):
@@ -274,525 +296,378 @@ def print_summary(df_assign, caps, elig, k, label, t_sec):
         wall time         : {t_sec:.1f}s
         ──────────────────────────────────────────────────────────
     """).strip())
-    
-    # Validate sponsorship ratios if group data is available
     if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
         group_ratios = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
         validate_sponsorship_ratios(df_assign, elig, group_ratios, caps)
 
 
-def greedy(caps, elig, k, seed=42, group_ratios=None, timeout=None):
-    """
-    FAST brand-focused greedy algorithm that prioritizes business constraints over user scores.
-    Uses vectorized operations for 10-100x speed improvement.
-    Focuses on: 1) Sponsorship ratios, 2) Brand capacity utilization, 3) User scores
-    """
+# =====================================================================
+# Greedy (enhanced): dynamic ratio guard + per-group mixed cap + 3rd-slot mixing
+#                    + scarcity weighting for sponsored contracts
+# =====================================================================
+def greedy(
+    caps, elig, k, seed=42,
+    group_ratios=None, timeout=None,
+    cache_factor=10, mix_tail=False, sponsored_first_rounds=2,
+    third_slot_only_mixing=True,
+    enforce_assignment_ratio=False, assignment_ratio_guard="hard",
+    ratio_slack=0.0, unspon_overflow_pct=0.0,
+    max_sponsored_ratio=None, max_mixed_share=1.0,
+    scarcity_alpha: float = 0.0
+):
     start_time = time.time()
     rng = np.random.default_rng(seed)
-    
-    # Pre-process data for fast lookups
     print(f"[greedy] Pre-processing data for {len(elig):,} elig pairs...")
-    
-    # Convert caps to dict for O(1) lookups
+
+    # Remaining capacity per contract
     remaining = caps.set_index('contract_address').cap_face.to_dict()
-    
-    # Pre-filter and sort sponsored eligibility by score (vectorized)
-    sponsored_elig = elig[elig['is_sponsored'] == True].copy()
-    sponsored_elig = sponsored_elig.sort_values('score', ascending=False)
-    
-    # Pre-filter unsponsored eligibility by score (vectorized)
-    unsponsored_elig = elig[elig['is_sponsored'] == False].copy()
-    unsponsored_elig = unsponsored_elig.sort_values('score', ascending=False)
-    
-    # Create fast user lookup structures
+    c_is_spon = caps.set_index('contract_address')['is_sponsored'].to_dict()
+    cap_face_map = caps.set_index('contract_address').cap_face.to_dict()
+
+    # Pre-sort eligibility by score (desc)
+    sponsored_elig = elig[elig['is_sponsored'] == True].copy().sort_values('score', ascending=False)
+    unsponsored_elig = elig[elig['is_sponsored'] == False].copy().sort_values('score', ascending=False)
+
+    # Fast per-user caches
     user_to_group = elig.groupby('user_id')['group_id'].first().to_dict()
-    # Build per-user top-(cache_factor*k) offers dictionaries (more options for top-up)
-    cache_factor = 10
-    user_to_sponsored_offers = {uid: grp.nlargest(k * cache_factor, 'score')
-                                for uid, grp in sponsored_elig.groupby('user_id')}
-    user_to_unsponsored_offers = {uid: grp.nlargest(k * cache_factor, 'score')
-                                  for uid, grp in unsponsored_elig.groupby('user_id')}
-    
-    # Track assignments and progress
-    chosen = []
-    assigned_users = set()
-    user_sponsorship = {}  # user_id -> sponsorship_type (True/False)
-    
-    # Phase 1: Meet sponsorship ratios (vectorized approach)
-    if group_ratios is not None:
-        print(f"[greedy] Phase 1: Meeting sponsorship ratios for {len(group_ratios)} groups")
-        # Reserve time budget: dedicate ~30% of total timeout to Phase 1, leaving the rest for Phase 2
-        total_deadline = (start_time + float(timeout)) if timeout else None
-        p1_deadline = (start_time + 0.3*float(timeout)) if timeout else None
-        
-        # Calculate group targets and current progress
-        group_targets = {}
-        group_current = {}
-        
-        for _, row in group_ratios.iterrows():
-            group_id = row['group_id']
-            ratio = row['sponsorship_ratio']
-            group_users = elig[elig['group_id'] == group_id]['user_id'].unique()
-            group_targets[group_id] = int(math.ceil(len(group_users) * ratio))
-            group_current[group_id] = 0
-        
-        # Sort groups by priority (most behind first)
-        groups_by_priority = sorted(
-            group_targets.items(),
-            key=lambda x: (x[1] - group_current.get(x[0], 0), -x[1]),
-            reverse=True
-        )
-        
-        # Process each group to meet targets
-        for group_id, target in groups_by_priority:
-            if group_current[group_id] >= target:
-                continue
-                
-            # Get users in this group who can receive sponsored offers
-            group_users = elig[elig['group_id'] == group_id]['user_id'].unique()
-            available_users = [u for u in group_users if u not in assigned_users]
-            
-            # Sort users by their best sponsored offer score
-            user_scores = []
-            for user_id in available_users:
-                if user_id in user_to_sponsored_offers:
-                    try:
-                        best_score = user_to_sponsored_offers[user_id]['score'].max()
-                        user_scores.append((user_id, best_score))
-                    except (KeyError, AttributeError):
-                        # Skip users with invalid data
-                        continue
-            
-            # Sort by score and assign
-            user_scores.sort(key=lambda x: x[1], reverse=True)
-            
-            for user_id, _ in user_scores:
-                if group_current[group_id] >= target:
-                    break
-                    
-                # Get user's sponsored offers
-                if user_id in user_to_sponsored_offers:
-                    try:
-                        user_offers = user_to_sponsored_offers[user_id]
-                        # Try to assign best available sponsored offer
-                        for _, offer in user_offers.iterrows():
-                            contract = offer['contract_address']
-                            if remaining.get(contract, 0) > 0:
-                                # Assign this offer
-                                chosen.append(offer)
-                                remaining[contract] -= 1
-                                assigned_users.add(user_id)
-                                user_sponsorship[user_id] = True
-                                group_current[group_id] += 1
-                                break
-                    except (KeyError, AttributeError):
-                        # Skip users with invalid data
-                        continue
-                
-                # Check timeout (Phase 1 budget)
-                if p1_deadline and time.time() > p1_deadline:
-                    print(f"[greedy] Phase 1 timeout reached ({timeout}s), stopping early")
-                    break
-            
-            # Check timeout after each group (Phase 1 budget)
-            if p1_deadline and time.time() > p1_deadline:
-                break
-    
-    # Phase 2: Top-up all users in rounds to reach k offers, exhausting capacity
-    print(f"[greedy] Phase 2: Topping up users to {k} offers in rounds (exhaust capacity)")
-    
-    # Helpers to track what's already assigned
-    assigned_pairs = set()  # (user_id, contract_address)
-    user_assigned_count = {}
-    for s in chosen:
+    user_to_sponsored_offers = {uid: grp.nlargest(k * cache_factor, 'score') for uid, grp in sponsored_elig.groupby('user_id')}
+    user_to_unsponsored_offers = {uid: grp.nlargest(k * cache_factor, 'score') for uid, grp in unsponsored_elig.groupby('user_id')}
+
+    # Group metadata
+    all_gids = list(elig['group_id'].unique())
+    gid_users = {gid: set(elig[elig['group_id']==gid]['user_id'].unique().tolist()) for gid in all_gids}
+    gid_ratio  = {row['group_id']: float(row['sponsorship_ratio']) for _, row in group_ratios.iterrows()} if group_ratios is not None else {}
+    gid_usercnt = {gid: len(users) for gid, users in gid_users.items()}
+
+    # Trackers
+    assigned_pairs = set()      # (user_id, contract_address)
+    user_assigned_count = {}    # user -> total assigned
+    user_sponsored_count = {}   # user -> sponsored assigned
+    user_sponsorship = {}       # user -> True(spon) / False(unspon)
+    mixed_users_by_gid = {gid: set() for gid in all_gids}
+
+    # Group-level counters (assignment level)
+    gid_assign_total = {gid: 0 for gid in all_gids}
+    gid_assign_unspon = {gid: 0 for gid in all_gids}
+    gid_sponsored_users = {gid: 0 for gid in all_gids}      # user-level count (≥1 spon)
+    gid_sponsored_user_set = {gid: set() for gid in all_gids}
+
+    # Optional cap on number of sponsored users (user-level)
+    gid_sponsored_user_cap = None
+    if max_sponsored_ratio is not None:
+        gid_sponsored_user_cap = {gid: int(math.floor(gid_usercnt[gid] * float(max_sponsored_ratio))) for gid in all_gids}
+
+    # --- scarcity weighting helpers ---
+    def _eff_score(row, scarcity_alpha: float, remaining: dict, cap_face_map: dict) -> float:
+        """Effective score for sponsored offers with remaining headroom."""
         try:
-            uid = s['user_id']; ca = s['contract_address']
-            assigned_pairs.add((uid, ca))
-            user_assigned_count[uid] = user_assigned_count.get(uid, 0) + 1
+            if scarcity_alpha <= 0.0 or not bool(row['is_sponsored']):
+                return float(row['score'])
+            ca = row['contract_address']
+            cap = float(cap_face_map.get(ca, 0) or 0)
+            if cap <= 0:
+                return float(row['score'])
+            pressure = max(0.0, min(1.0, (remaining.get(ca, 0) or 0) / cap))
+            return float(row['score']) * (1.0 + scarcity_alpha * pressure)
         except Exception:
-            continue
-    
-    all_users_list = elig['user_id'].unique().tolist()
-    total_possible = len(all_users_list) * k
-    
-    def try_assign_offer(offer_row):
+            # fail-open to original score
+            return float(row['score'])
+
+    # Helper: checks if an unsponsored pick is allowed under the chosen guard
+    def can_place_unsponsored_in_group(gid: str) -> bool:
+        if not enforce_assignment_ratio:
+            return True
+        r = gid_ratio.get(gid, 0.0)
+        T = gid_assign_total[gid]
+        U = gid_assign_unspon[gid]
+        S = T - U  # sponsored assignments so far
+
+        guard = (assignment_ratio_guard or "none").lower()
+        if guard == "none":
+            return True
+
+        if guard == "hard":
+            # After placing one unsponsored: S / (T+1) >= r - ratio_slack
+            # i.e., S >= (r - slack) * (T+1)
+            return S >= (r - float(ratio_slack)) * (T + 1 + 1e-9)
+
+        # moving: U <= ((1-r)/r) * S  + slack_abs*(T)
+        if r <= 1e-9:  # degenerate (all unsponsored allowed)
+            return True
+        max_unspon_now = ((1.0 - r) / r) * S + float(ratio_slack) * max(1.0, T)
+        return (U + 1) <= max_unspon_now
+
+    def would_exceed_sponsored_user_cap(gid: str, uid: str) -> bool:
+        if gid_sponsored_user_cap is None:
+            return False
+        if uid in gid_sponsored_user_set[gid]:
+            return False
+        return gid_sponsored_users[gid] >= gid_sponsored_user_cap[gid]
+
+    def bump_group_counters(uid: str, gid: str, is_spon: bool):
+        gid_assign_total[gid] += 1
+        if not is_spon:
+            gid_assign_unspon[gid] += 1
+        if is_spon and uid not in gid_sponsored_user_set[gid]:
+            gid_sponsored_user_set[gid].add(uid)
+            gid_sponsored_users[gid] += 1
+
+    def try_assign_offer(offer_row) -> bool:
+        """Central gate that enforces: caps, duplicates, per-user k, assignment ratio guard, third-slot-only mixing, per-group mixed cap, sponsored-user cap."""
         uid = offer_row['user_id']; ca = offer_row['contract_address']
-        if (uid, ca) in assigned_pairs:
+        gid = offer_row['group_id']; is_spon_offer = bool(offer_row['is_sponsored'])
+
+        # Cap & duplicates
+        if remaining.get(ca, 0) <= 0: return False
+        if (uid, ca) in assigned_pairs: return False
+        if user_assigned_count.get(uid, 0) >= k: return False
+
+        # Assignment-level ratio guard for UNSPON
+        if (not is_spon_offer) and (not can_place_unsponsored_in_group(gid)):
             return False
-        if user_assigned_count.get(uid, 0) >= k:
+
+        # Third-slot-only mixing rules
+        utype = user_sponsorship.get(uid, None)
+        u_assigned = user_assigned_count.get(uid, 0)
+        u_spon = user_sponsored_count.get(uid, 0)
+
+        # If user type is unknown and offer is sponsored, check sponsored-user cap (if any)
+        if utype is None and is_spon_offer and would_exceed_sponsored_user_cap(gid, uid):
             return False
-        if remaining.get(ca, 0) <= 0:
-            return False
-        # Assign
-        chosen.append(offer_row)
-        remaining[ca] -= 1
+
+        # Mixing control
+        if utype is None:
+            pass  # establishing type via this assignment is allowed
+        else:
+            if utype and (not is_spon_offer):
+                # user is 'sponsored-type' but offer is unsponsored
+                if not mix_tail:
+                    return False
+                if third_slot_only_mixing:
+                    # Only allow for last slot AND after they have the required sponsored-first rounds
+                    if not (u_assigned == k - 1 and u_spon >= min(sponsored_first_rounds, k - 1)):
+                        return False
+            if (not utype) and is_spon_offer:
+                # user is 'unsponsored-type' but offer is sponsored (avoid mixing inward)
+                if u_assigned > 0:
+                    return False  # keep them pure unless establishing type
+
+        # Mixed users per-group cap
+        will_be_mixed = False
+        if utype is not None and (utype != is_spon_offer):
+            will_be_mixed = True
+        if will_be_mixed:
+            group_size = max(1, len(gid_users.get(gid, [])))
+            if (len(mixed_users_by_gid[gid]) + (0 if uid in mixed_users_by_gid[gid] else 1)) / group_size > float(max_mixed_share):
+                return False
+
+        # All guards passed → assign
         assigned_pairs.add((uid, ca))
-        user_assigned_count[uid] = user_assigned_count.get(uid, 0) + 1
+        remaining[ca] -= 1
+        user_assigned_count[uid] = u_assigned + 1
+        if is_spon_offer:
+            user_sponsored_count[uid] = u_spon + 1
+
+        # Establish user type if unknown
+        if utype is None:
+            user_sponsorship[uid] = is_spon_offer
+            # bump user-level sponsored counts if we just made them sponsored
+            if is_spon_offer:
+                if uid not in gid_sponsored_user_set[gid]:
+                    gid_sponsored_user_set[gid].add(uid)
+                    gid_sponsored_users[gid] += 1
+        else:
+            if will_be_mixed:
+                mixed_users_by_gid[gid].add(uid)
+
+        # assignment-level counters
+        bump_group_counters(uid, gid, is_spon_offer)
         return True
 
-    # Sponsored offers accessor (use precomputed top list only; avoid extended scans)
-    def get_user_sponsored_offers(user_id):
-        return user_to_sponsored_offers.get(user_id, pd.DataFrame())
+    # Utility: iterate a user's best available offers for a given type (with optional scarcity weighting for sponsored)
+    def iter_user_offers(uid: str, sponsored: bool, scarcity_alpha_local: float = 0.0):
+        df = user_to_sponsored_offers.get(uid) if sponsored else user_to_unsponsored_offers.get(uid)
+        if df is None or df.empty:
+            return
+        if sponsored and scarcity_alpha_local > 0.0:
+            tmp = df.copy()
+            tmp['__eff'] = tmp.apply(lambda r: _eff_score(r, scarcity_alpha_local, remaining, cap_face_map), axis=1)
+            tmp = tmp.sort_values('__eff', ascending=False)
+            for _, r in tmp.iterrows():
+                yield r
+        else:
+            for _, r in df.iterrows():
+                yield r
 
-    # Compute group deficits before Phase 2 for targeting
-    deficits_by_group = None
-    group_targets_now = {}
-    group_current_now = {}
+    # ── Phase 1: meet user-level sponsorship minima (make enough users 'sponsored-type')
     if group_ratios is not None:
-        for _, row in group_ratios.iterrows():
-            gid = row['group_id']
-            users_in_group = elig[elig['group_id'] == gid]['user_id'].nunique()
-            group_targets_now[gid] = int(math.ceil(users_in_group * float(row['sponsorship_ratio'])))
-        # current sponsored users with >=1 assignment so far
-        for uid, is_spon in user_sponsorship.items():
-            if is_spon and user_assigned_count.get(uid, 0) > 0:
-                gid = user_to_group.get(uid)
-                if gid is not None:
-                    group_current_now[gid] = group_current_now.get(gid, 0) + 1
-        deficits_by_group = {gid: max(0, group_targets_now.get(gid, 0) - group_current_now.get(gid, 0)) for gid in group_targets_now.keys()}
-
-    # Pre-sweep: seed sponsored assignments for users in deficit groups (one per user), with strict caps
-    if deficits_by_group is not None and any(v > 0 for v in deficits_by_group.values()):
-        sweep_time_budget = 0.10 * float(timeout) if timeout else None
-        sweep_deadline = (start_time + sweep_time_budget) if sweep_time_budget else None
-        for gid, deficit in sorted(deficits_by_group.items(), key=lambda x: x[1], reverse=True):
-            if deficit <= 0:
-                continue
-            max_users_for_group = min(int(deficit), 1000)
-            processed = 0
-            grp_users = elig[elig['group_id'] == gid]['user_id'].unique()
-            for uid in grp_users:
-                if sweep_deadline and time.time() > sweep_deadline:
-                    break
-                if total_deadline and time.time() > total_deadline:
-                    break
-                if processed >= max_users_for_group:
-                    break
-                if deficits_by_group.get(gid, 0) <= 0:
-                    break
-                # Skip users locked to unsponsored
-                if user_sponsorship.get(uid) is False:
-                    continue
-                # Try to assign one sponsored offer for this user using top list only
-                cand_df = get_user_sponsored_offers(uid)
-                if cand_df is None or cand_df.empty:
-                    continue
-                for _, offer in cand_df.iterrows():
-                    ca = offer['contract_address']
-                    if (uid, ca) in assigned_pairs:
-                        continue
-                    if remaining.get(ca, 0) <= 0:
-                        continue
+        print(f"[greedy] Phase 1: Meeting sponsorship minima for {len(group_ratios)} groups")
+        group_targets = {row['group_id']: int(math.ceil(gid_usercnt[row['group_id']] * float(row['sponsorship_ratio'])))
+                         for _, row in group_ratios.iterrows()}
+        for gid, target in sorted(group_targets.items(), key=lambda kv: kv[1], reverse=True):
+            if gid_sponsored_users[gid] >= target: continue
+            users = list(gid_users[gid])
+            scored = []
+            for uid in users:
+                df = user_to_sponsored_offers.get(uid)
+                if df is None or df.empty: continue
+                best = df['score'].max()
+                scored.append((uid, best))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            for uid, _ in scored:
+                if gid_sponsored_users[gid] >= target: break
+                df = user_to_sponsored_offers.get(uid)
+                if df is None or df.empty: continue
+                for _, offer in df.iterrows():
+                    if offer['group_id'] != gid or not offer['is_sponsored']: continue
                     if try_assign_offer(offer):
-                        user_sponsorship[uid] = True
-                        if gid is not None:
-                            group_current_now[gid] = group_current_now.get(gid, 0) + 1
-                            deficits_by_group[gid] = max(0, group_targets_now.get(gid, 0) - group_current_now.get(gid, 0))
-                        processed += 1
                         break
-                # move to next user regardless
-    
-    # Round-robin: for t = current_assigned+1 .. k, give at most one additional offer per user per round
+
+    # ── Phase 2: round-robin top-up to k offers (respect type; allow only 3rd-slot mixing)
+    print(f"[greedy] Phase 2: Round-robin top-up to {k} offers")
+    all_users = list(elig['user_id'].unique())
     for round_idx in range(1, k+1):
         made_progress = False
-        for uid in all_users_list:
-            # stop early if we already filled everything or timed out
-            if len(chosen) >= total_possible:
-                break
-            # Phase 2 uses the full remaining time until total deadline
-            if total_deadline and time.time() > total_deadline:
-                print(f"[greedy] Phase 2 timeout reached ({timeout}s), stopping early")
-                break
-            # Skip users already at or above this round (e.g., already have >= round_idx offers)
-            if user_assigned_count.get(uid, 0) >= round_idx:
-                continue
-            # Decide/obtain the user's sponsorship type
-            if uid not in user_sponsorship:
-                # Pick the type that yields the highest next-score assignable offer
-                # Force sponsored type for deficit groups if any viable sponsored capacity exists (using top list)
-                force_spon = False
-                if deficits_by_group is not None:
-                    gid = user_to_group.get(uid)
-                    if gid is not None and deficits_by_group.get(gid, 0) > 0:
-                        check_df = get_user_sponsored_offers(uid)
-                        if check_df is not None and not check_df.empty:
-                            for _, row in check_df.iterrows():
-                                if (uid, row['contract_address']) not in assigned_pairs and remaining.get(row['contract_address'], 0) > 0:
-                                    force_spon = True
-                                    break
-                cand_spon = get_user_sponsored_offers(uid)
-                cand_uns  = user_to_unsponsored_offers.get(uid, pd.DataFrame())
-                best_spon = None
-                if not cand_spon.empty:
-                    for _, row in cand_spon.iterrows():
-                        if (uid, row['contract_address']) not in assigned_pairs and remaining.get(row['contract_address'], 0) > 0:
-                            best_spon = row
-                            break
-                best_uns = None
-                if not cand_uns.empty:
-                    for _, row in cand_uns.iterrows():
-                        if (uid, row['contract_address']) not in assigned_pairs and remaining.get(row['contract_address'], 0) > 0:
-                            best_uns = row
-                            break
-                # Choose sponsored when both are viable (small bias toward sponsored)
-                if force_spon and best_spon is not None:
-                    user_sponsorship[uid] = True
-                elif best_spon is not None and best_uns is not None:
-                    user_sponsorship[uid] = True
-                elif best_spon is not None:
-                    user_sponsorship[uid] = True
-                elif best_uns is not None:
+        for uid in all_users:
+            if user_assigned_count.get(uid, 0) >= round_idx: continue
+            gid = user_to_group.get(uid)
+
+            utype = user_sponsorship.get(uid, None)
+            # Decide type if unknown: prefer sponsored unless cap blocks
+            if utype is None:
+                if gid is not None and would_exceed_sponsored_user_cap(gid, uid):
                     user_sponsorship[uid] = False
+                    utype = False
                 else:
-                    # No capacity-matching offers for this user
-                    continue
-            # Fetch offers in the user's chosen type
-            user_offers_df = user_to_sponsored_offers.get(uid, pd.DataFrame()) if user_sponsorship[uid] else user_to_unsponsored_offers.get(uid, pd.DataFrame())
-            if user_offers_df is None or user_offers_df.empty:
-                continue
-            # Try to assign the best next available offer for this user
-            assigned_this_user = False
-            sponsored_try_limit = 5
-            tries = 0
-            if user_sponsorship[uid] and force_spon:
-                # attempt limited sponsored tries, then fallback to unsponsored within same iteration
-                for _, offer in user_offers_df.iterrows():
-                    tries += 1
-                    if try_assign_offer(offer):
-                        made_progress = True
-                        assigned_this_user = True
-                        break
-                    if tries >= sponsored_try_limit:
-                        break
-                if not assigned_this_user and user_assigned_count.get(uid, 0) < k:
-                    # fallback to unsponsored for this iteration
-                    cand_uns_df = user_to_unsponsored_offers.get(uid, pd.DataFrame())
-                    if cand_uns_df is not None and not cand_uns_df.empty:
-                        for _, offer in cand_uns_df.iterrows():
-                            if try_assign_offer(offer):
-                                user_sponsorship[uid] = False
-                                made_progress = True
-                                assigned_this_user = True
-                                break
-            else:
-                for _, offer in user_offers_df.iterrows():
-                    if try_assign_offer(offer):
-                        made_progress = True
-                        assigned_this_user = True
-                        break
-            # If this user had no assignable offers left in their type, skip
-        # If a full round made no progress, stop to avoid spinning
+                    user_sponsorship[uid] = True
+                    utype = True
+
+            if utype:  # sponsored-type
+                placed = False
+                for r in iter_user_offers(uid, True, scarcity_alpha):
+                    if try_assign_offer(r):
+                        placed = True; break
+                if not placed and mix_tail:
+                    if third_slot_only_mixing and round_idx == k and user_sponsored_count.get(uid, 0) >= min(sponsored_first_rounds, k-1):
+                        for r in iter_user_offers(uid, False, scarcity_alpha):
+                            if try_assign_offer(r):
+                                placed = True; break
+                made_progress |= placed
+            else:  # unsponsored-type
+                placed = False
+                for r in iter_user_offers(uid, False, scarcity_alpha):
+                    if try_assign_offer(r):
+                        placed = True; break
+                made_progress |= placed
+
         if not made_progress:
             break
 
-    # Dynamic group deficits for prioritization in sweeps
-    group_current_now = {}
-    group_targets_now = {}
-    deficits_by_group = None
-    if group_ratios is not None:
-        # Targets from ratios
-        for _, row in group_ratios.iterrows():
-            gid = row['group_id']
-            users_in_group = elig[elig['group_id'] == gid]['user_id'].nunique()
-            group_targets_now[gid] = int(math.ceil(users_in_group * float(row['sponsorship_ratio'])))
-        # Current sponsored users (with >=1 assignment)
-        for uid, is_spon in user_sponsorship.items():
-            if is_spon and user_assigned_count.get(uid, 0) > 0:
-                gid = user_to_group.get(uid)
-                if gid is not None:
-                    group_current_now[gid] = group_current_now.get(gid, 0) + 1
-        deficits_by_group = {gid: max(0, group_targets_now.get(gid, 0) - group_current_now.get(gid, 0)) for gid in group_targets_now.keys()}
-
-    # Post top-up sponsored capacity sweep: try to drain remaining sponsored units
-    # Assign to eligible users below k, keeping uniformity and no duplicates
-    if remaining:
-        # Precompute sponsorship map for contracts
-        c_is_spon = caps.set_index('contract_address')['is_sponsored'].to_dict()
-        # Iterate sponsored contracts with remaining capacity
-        for ca, cap_left in list(remaining.items()):
-            if cap_left <= 0:
+    # ── Sponsored sweep: drain remaining sponsored capacity toward under-filled users
+    print("[greedy] Sponsored sweep (pressure-first)")
+    spon_contracts = [ca for ca in remaining if c_is_spon.get(ca, False) and remaining[ca] > 0]
+    spon_contracts.sort(key=lambda ca: remaining[ca], reverse=True)
+    for ca in spon_contracts:
+        cand = sponsored_elig[sponsored_elig['contract_address'] == ca]
+        if cand.empty: continue
+        for _, offer in cand.iterrows():
+            uid = offer['user_id']
+            if user_assigned_count.get(uid, 0) >= k: continue
+            if user_sponsorship.get(uid, None) is False:
                 continue
-            if not c_is_spon.get(ca, False):
-                continue  # only sponsored sweep
-            # Candidates: sponsored eligibility rows for this contract, sorted by score
-            cand_df = sponsored_elig[sponsored_elig['contract_address'] == ca]
-            if cand_df.empty:
-                continue
-            # Prioritize groups with largest sponsorship deficits, then score
-            if deficits_by_group is not None:
-                cand_df = cand_df.assign(_gid=cand_df['user_id'].map(user_to_group))
-                cand_df['_deficit'] = cand_df['_gid'].map(deficits_by_group).fillna(0)
-                cand_df = cand_df.sort_values(['_deficit', 'score'], ascending=[False, False])
-            for _, offer in cand_df.iterrows():
-                if total_deadline and time.time() > total_deadline:
-                    break
-                if remaining.get(ca, 0) <= 0:
-                    break
-                uid = offer['user_id']
-                # skip users already at k, duplicates, or locked to unsponsored
-                if user_assigned_count.get(uid, 0) >= k:
-                    continue
-                if (uid, ca) in assigned_pairs:
-                    continue
-                if uid in user_sponsorship and user_sponsorship[uid] is False:
-                    continue
-                # ensure user sponsorship is sponsored (uniformity)
-                if uid not in user_sponsorship:
-                    user_sponsorship[uid] = True
-                    if deficits_by_group is not None:
-                        gid = user_to_group.get(uid)
-                        if gid is not None:
-                            group_current_now[gid] = group_current_now.get(gid, 0) + 1
-                            deficits_by_group[gid] = max(0, group_targets_now.get(gid, 0) - group_current_now.get(gid, 0))
-                if try_assign_offer(offer):
-                    # already updated counts/capacity
-                    continue
+            try_assign_offer(offer)
+            if remaining[ca] <= 0: break
 
-    # Conversion sweep: convert fully-unsponsored users to sponsored when enough sponsored capacity exists
-    # Keeps all-or-nothing: only flip a user if we can replace ALL of their unsponsored assignments
-    if remaining:
-        # Users eligible for conversion: currently marked unsponsored and have at least one assignment
-        unspon_users = [uid for uid, t in user_sponsorship.items() if t is False and user_assigned_count.get(uid, 0) > 0]
-        # Prioritize: fewest assigned first, then biggest group deficits
-        if deficits_by_group is not None:
-            unspon_users.sort(key=lambda u: (user_assigned_count.get(u, 0), -deficits_by_group.get(user_to_group.get(u), 0)))
-        else:
-            unspon_users.sort(key=lambda u: user_assigned_count.get(u, 0))
-        # Iterate users; respect overall timeout
-        for uid in unspon_users:
-            if total_deadline and time.time() > total_deadline:
+    # ── Conversion sweep: turn fully-unsponsored users into sponsored when possible
+    print("[greedy] Conversion sweep (unsponsored → sponsored where possible)")
+    unspon_users = [u for u, t in user_sponsorship.items() if t is False and user_assigned_count.get(u,0) > 0]
+    unspon_users.sort(key=lambda u: user_assigned_count.get(u,0))
+    for uid in unspon_users:
+        gid = user_to_group.get(uid)
+        if would_exceed_sponsored_user_cap(gid, uid): continue
+        need = user_assigned_count.get(uid, 0)
+        picks = []
+        df = user_to_sponsored_offers.get(uid)
+        if df is None or df.empty: continue
+        seen = set()
+        for _, r in df.iterrows():
+            ca = r['contract_address']
+            if remaining.get(ca,0) <= 0: continue
+            if (uid, ca) in assigned_pairs: continue
+            if ca in seen: continue
+            picks.append(r); seen.add(ca)
+            if len(picks) >= need: break
+        if len(picks) < need: continue
+        # remove all current (unsponsored) assignments for this user
+        to_remove = [ca for (u,ca) in list(assigned_pairs) if u == uid and not c_is_spon.get(ca, False)]
+        for ca in to_remove:
+            assigned_pairs.remove((uid, ca))
+            remaining[ca] = remaining.get(ca,0) + 1
+            user_assigned_count[uid] -= 1
+            gid_assign_total[gid] -= 1
+            gid_assign_unspon[gid] -= 1
+        # assign sponsored replacements
+        ok = True
+        for r in picks:
+            if not try_assign_offer(r):
+                ok = False; break
+        if ok:
+            user_sponsorship[uid] = True  # converted
+
+    # ── Unsponsored sweep: place unsponsored for users below k (respect guards)
+    print("[greedy] Unsponsored sweep (pressure-first)")
+    unspon_contracts = [ca for ca in remaining if not c_is_spon.get(ca, False) and remaining[ca] > 0]
+    unspon_contracts.sort(key=lambda ca: remaining[ca], reverse=True)
+    for ca in unspon_contracts:
+        cand = unsponsored_elig[unsponsored_elig['contract_address'] == ca]
+        if cand.empty: continue
+        for _, offer in cand.iterrows():
+            uid = offer['user_id']; gid = offer['group_id']
+            if user_assigned_count.get(uid,0) >= k: continue
+            if user_sponsorship.get(uid, None) is True:
+                continue  # keep purity; third-slot handled later
+            try_assign_offer(offer)
+            if remaining[ca] <= 0: break
+
+    # ── Coverage sweep: fill to k; prefer sponsored; third-slot unspon only if allowed & guard passes
+    print("[greedy] Coverage sweep (fill to k; mixed types allowed)")
+    all_users = list(elig['user_id'].unique())
+    underfilled = [u for u in all_users if user_assigned_count.get(u,0) < k]
+    for uid in underfilled:
+        need = k - user_assigned_count.get(uid,0)
+        if need <= 0: continue
+        for _ in range(need):
+            placed = False
+            # try sponsored first (scarcity-weighted)
+            for r in iter_user_offers(uid, True, scarcity_alpha):
+                if try_assign_offer(r):
+                    placed = True; break
+            if not placed and mix_tail:
+                # Allow unsponsored only for final slot condition (third-slot-only)
+                if third_slot_only_mixing and user_assigned_count.get(uid,0) == k - 1 and user_sponsored_count.get(uid,0) >= min(sponsored_first_rounds, k-1):
+                    for r in iter_user_offers(uid, False, scarcity_alpha):
+                        if try_assign_offer(r):
+                            placed = True; break
+            if not placed:
                 break
-            current_n = user_assigned_count.get(uid, 0)
-            if current_n <= 0:
-                continue
-            # Identify unsponsored assignments to remove for this user
-            user_unspon_assigned_contracts = [ca for (u, ca) in assigned_pairs if u == uid and not c_is_spon.get(ca, False)]
-            if len(user_unspon_assigned_contracts) != current_n:
-                # This user may already be mixed due to prior logic; skip to preserve uniformity
-                continue
-            # Gather candidate sponsored offers with remaining capacity for this user
-            cand_spon_df = user_to_sponsored_offers.get(uid, pd.DataFrame())
-            if cand_spon_df is None or cand_spon_df.empty:
-                continue
-            cand_rows = []
-            seen_contracts = set()
-            for _, row in cand_spon_df.iterrows():
-                ca = row['contract_address']
-                if (uid, ca) in assigned_pairs:
-                    continue
-                if remaining.get(ca, 0) <= 0:
-                    continue
-                if ca in seen_contracts:
-                    continue
-                cand_rows.append(row)
-                seen_contracts.add(ca)
-                if len(cand_rows) >= current_n:
-                    break
-            # Only proceed if we can replace ALL existing unsponsored picks
-            if len(cand_rows) < current_n:
-                continue
-            # Perform conversion: remove unsponsored assignments, then add sponsored ones
-            # Remove unsponsored assignments
-            for ca in user_unspon_assigned_contracts:
-                if (uid, ca) in assigned_pairs:
-                    assigned_pairs.remove((uid, ca))
-                    user_assigned_count[uid] = user_assigned_count.get(uid, 1) - 1
-                    remaining[ca] = remaining.get(ca, 0) + 1
-            # Assign sponsored replacements (count back to previous level)
-            for row in cand_rows:
-                try_assign_offer(row)
-            # If conversion succeeded (no unsponsored left), flip type to sponsored
-            # Verify: user has no unsponsored assignments in assigned_pairs
-            still_unspon = any((u == uid and not c_is_spon.get(ca, False)) for (u, ca) in assigned_pairs)
-            if not still_unspon:
-                user_sponsorship[uid] = True
-                if deficits_by_group is not None:
-                    gid = user_to_group.get(uid)
-                    if gid is not None:
-                        group_current_now[gid] = group_current_now.get(gid, 0) + 1
-                        deficits_by_group[gid] = max(0, group_targets_now.get(gid, 0) - group_current_now.get(gid, 0))
-                # Post-conversion top-up: try to fill remaining slots up to k with sponsored offers
-                cand_spon_df2 = user_to_sponsored_offers.get(uid, pd.DataFrame())
-                if cand_spon_df2 is not None and not cand_spon_df2.empty:
-                    for _, row2 in cand_spon_df2.iterrows():
-                        if total_deadline and time.time() > total_deadline:
-                            break
-                        if user_assigned_count.get(uid, 0) >= k:
-                            break
-                        ca2 = row2['contract_address']
-                        if (uid, ca2) in assigned_pairs:
-                            continue
-                        if remaining.get(ca2, 0) <= 0:
-                            continue
-                        try_assign_offer(row2)
-            else:
-                # Rollback not implemented; extremely unlikely due to pre-check len(cand_rows) >= current_n
-                # If it happens, leave user type as unsponsored to avoid mixing
-                pass
 
-    # Post top-up unsponsored capacity sweep: drain remaining unsponsored units
-    # Assign to eligible users below k, keeping uniformity and no duplicates
-    if remaining:
-        for ca, cap_left in list(remaining.items()):
-            if cap_left <= 0:
-                continue
-            if c_is_spon.get(ca, False):
-                continue  # only unsponsored sweep here
-            cand_df = unsponsored_elig[unsponsored_elig['contract_address'] == ca]
-            if cand_df.empty:
-                continue
-            for _, offer in cand_df.iterrows():
-                if total_deadline and time.time() > total_deadline:
-                    break
-                if remaining.get(ca, 0) <= 0:
-                    break
-                uid = offer['user_id']
-                # skip users already at k, duplicates, or locked to sponsored
-                if user_assigned_count.get(uid, 0) >= k:
-                    continue
-                if (uid, ca) in assigned_pairs:
-                    continue
-                if uid in user_sponsorship and user_sponsorship[uid] is True:
-                    continue
-                # ensure user sponsorship is unsponsored (uniformity)
-                if uid not in user_sponsorship:
-                    user_sponsorship[uid] = False
-                try_assign_offer(offer)
-        
-    
-    # Convert to DataFrame from final assignment pairs to reflect any conversions
+    # Build final DataFrame from assigned_pairs
     if len(assigned_pairs) == 0:
         result_df = pd.DataFrame(columns=elig.columns)
     else:
-        key_series = (elig['user_id'].astype('string') + '|' + elig['contract_address'].astype('string'))
-        assigned_keys = set([str(u) + '|' + str(ca) for (u, ca) in assigned_pairs])
-        mask = key_series.isin(assigned_keys)
+        keys = set([f"{u}|{ca}" for (u,ca) in assigned_pairs])
+        ekeys = (elig['user_id'].astype('string') + '|' + elig['contract_address'].astype('string'))
+        mask = ekeys.isin(keys)
         result_df = elig.loc[mask].copy()
-    
+
     elapsed = time.time() - start_time
     print(f"[greedy] Completed: {len(assigned_pairs):,} assignments, {len(set([u for (u, _) in assigned_pairs])):,} users in {elapsed:.1f}s")
-    
-    # Print group progress summary
-    if group_ratios is not None:
-        print(f"[greedy] Group sponsorship progress:")
-        # Recompute from final assignments/types
-        current_map = {}
-        for uid, is_spon in user_sponsorship.items():
-            if is_spon and user_assigned_count.get(uid, 0) > 0:
-                gid = user_to_group.get(uid)
-                if gid is not None:
-                    current_map[gid] = current_map.get(gid, 0) + 1
-        for _, row in group_ratios.iterrows():
-            gid = row['group_id']
-            users_in_group = elig[elig['group_id'] == gid]['user_id'].nunique()
-            target = int(math.ceil(users_in_group * float(row['sponsorship_ratio'])))
-            current = current_map.get(gid, 0)
-            actual_ratio = (current / users_in_group) if users_in_group > 0 else 0.0
-            print(f"  Group {gid}: {current}/{target} ({actual_ratio:.1%} vs target {row['sponsorship_ratio']:.1%})")
-    
     return result_df
 
 
+# =====================================================================
+# ILP helpers and solvers (preserved)
+# =====================================================================
 def _parse_cov_w(cov_w_str: str, k: int):
     if not cov_w_str: return [0.0] * k
     parts = [float(x.strip()) for x in cov_w_str.split(',') if x.strip()]
@@ -809,12 +684,10 @@ def _hint_indices_from_greedy(elig: pd.DataFrame, g: pd.DataFrame) -> np.ndarray
     return np.flatnonzero(mask)
 
 
-# ---- safe sum wrapper for CP-SAT (avoids Python built-in 'sum' ambiguity)
 def LSum(items):
     return cp_model.LinearExpr.Sum(list(items))
 
 
-# ───────────── PuLP (z coverage mode) ─────────────
 def ilp_pulp(caps, elig, k, timeout, cov_w_str):
     if not HAVE_PULP: return None, 0.0
     t0 = time.time()
@@ -866,20 +739,16 @@ def ilp_pulp(caps, elig, k, timeout, cov_w_str):
     return elig.loc[pick], t
 
 
-# ---- AddHint compatibility (handles index property vs Index() method)
 def _add_hint_compat(model, x_vars, hint_idx):
     if len(hint_idx) == 0:
-        print("[warm-start] no hint rows")
-        return
+        print("[warm-start] no hint rows"); return
     try:
-        # Newer API path (expects var.index property)
         model.AddHint([x_vars[i] for i in hint_idx], [1] * len(hint_idx))
         print(f"[warm-start] hinted {len(hint_idx):,} vars via AddHint()")
         return
     except Exception as e1:
-        # Fallback: write into proto using Index() method
         try:
-            proto = model._CpModel__model  # CP-SAT python wrapper private field
+            proto = model._CpModel__model
             proto.solution_hint.vars.extend([x_vars[i].Index() for i in hint_idx])
             proto.solution_hint.values.extend([1] * len(hint_idx))
             print(f"[warm-start] hinted {len(hint_idx):,} vars via proto")
@@ -887,8 +756,7 @@ def _add_hint_compat(model, x_vars, hint_idx):
             print(f"[warm-start] failed to add hints: {e1} / {e2} → continuing without hints")
 
 
-# ───────────── OR-Tools CP-SAT ─────────────
-def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str, shortfall_penalty, warm_start):
+def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str, shortfall_penalty, warm_start, scarcity_alpha_ws: float = 0.0):
     if (not HAVE_OR) or (len(elig) > MAX_CP_SAT_VARS):
         reason = []
         if not HAVE_OR: reason.append("HAVE_OR=False")
@@ -919,59 +787,41 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
         addr = str(cid_cat.categories[cc])
         m.Add(LSum([x[i] for i in idx]) <= int(cap_vec[addr]))
 
-    # SPONSORSHIP RATIO CONSTRAINTS
-    # Create y[u] variables: 1 if user u gets sponsored contracts, 0 if non-sponsored
+    # SPONSORSHIP RATIO CONSTRAINTS (user-level minima) + uniformity
     y_user = {}
     for uc in range(len(uid_cat.categories)):
         user_id = str(uid_cat.categories[uc])
         y_user[uc] = m.NewBoolVar(f"y_user_{user_id}")
     
-    # Sponsorship uniformity constraints: if x[i]=1, then user's sponsorship type must match contract's
     for i in range(len(elig)):
-        uc = uid_cat.codes[i]  # user category index
+        uc = uid_cat.codes[i]
         is_sponsored = elig.iloc[i]['is_sponsored']
-        
         if pd.isna(is_sponsored):
             raise ValueError(f"Missing is_sponsored for elig row {i}")
-            
-        # Convert is_sponsored to boolean
         is_sponsored_bool = is_sponsored in [True, 1, '1', 'true', 'True', 't', 'T']
-        
         if is_sponsored_bool:
-            # If contract is sponsored, user must be in sponsored group: x[i] ≤ y[uc]
             m.Add(x[i] <= y_user[uc])
         else:
-            # If contract is non-sponsored, user must NOT be in sponsored group: x[i] ≤ (1 - y[uc])
             m.Add(x[i] <= (1 - y_user[uc]))
     
-    # Group sponsorship ratio constraints
-    # Group users by their group_id and enforce ratio constraints
     group_users = elig.groupby('group_id')['user_id'].apply(lambda x: x.unique()).to_dict()
     group_ratios_dict = elig.groupby('group_id')['sponsorship_ratio'].first().to_dict()
     
     for group_id, users_in_group in group_users.items():
         ratio = float(group_ratios_dict[group_id])
-        
-        # Find user category indices for this group
         group_user_cats = []
         for user_id in users_in_group:
             try:
                 uc = uid_cat.categories.get_loc(user_id)
                 group_user_cats.append(uc)
             except KeyError:
-                # User not in current elig data (filtered out), skip
                 continue
-        
         if group_user_cats:
-            # Sum of sponsored users in group ≥ group_size * ratio (minimum, can exceed)
             group_size = len(group_user_cats)
             min_sponsored = int(math.ceil(group_size * ratio))
             m.Add(LSum([y_user[uc] for uc in group_user_cats]) >= min_sponsored)
-            
             print(f"Group {group_id}: {group_size} users, ratio={ratio:.2f}, min_sponsored={min_sponsored}")
 
-    # Link y_user to having at least one assignment
-    # A user can only be counted as sponsored if they actually receive at least one assignment
     for uc, idx in idx_by_user.items():
         m.Add(LSum([x[i] for i in idx]) >= y_user[uc])
 
@@ -979,13 +829,10 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
     scores = (elig.score * 1_000_000).astype(int).to_numpy()
     obj_terms = [scores[i] * x[i] for i in range(len(elig))]
     
-    # Per-user sponsored bonus (not per eligible row)
-    # This reflects business preference for sponsored rewards
     sponsored_bonus = 1000  # Small bonus per sponsored user (adjust as needed)
     sponsored_terms = [sponsored_bonus * y_user[uc] for uc in range(len(uid_cat.categories))]
 
     if cov_mode == "z":
-        # coverage z_{u,t}: LSum(x_u) >= t * z_{u,t}
         cov_w = _parse_cov_w(cov_w_str, k)
         cov_terms = []
         for uc, idx in idx_by_user.items():
@@ -997,7 +844,6 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
                     cov_terms.append(int(cov_w[t-1] * 1_000_000) * zz)
         m.Maximize(LSum(obj_terms) + LSum(cov_terms) + LSum(sponsored_terms))
     else:
-        # shortfall mode: per-user shortfall penalty (lighter/faster)
         pen = int(float(shortfall_penalty) * 1_000_000)  # penalty per missing offer
         short_vars = []
         for uc, idx in idx_by_user.items():
@@ -1014,13 +860,10 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
     # Warm start from greedy (optional)
     if warm_start:
         t_ws = time.time()
-        # Get group ratios for greedy warm start
         group_ratios_for_greedy = None
         if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
             group_ratios_for_greedy = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
-        
-        # Extend warm-start time to push ratios further before seeding
-        g = greedy(caps, elig, k, seed=42, group_ratios=group_ratios_for_greedy, timeout=150)
+        g = greedy(caps, elig, k, seed=42, group_ratios=group_ratios_for_greedy, timeout=150, scarcity_alpha=scarcity_alpha_ws)
         hint_idx = _hint_indices_from_greedy(elig, g)
         _add_hint_compat(m, x, hint_idx)
         print(f"[warm-start] built in {time.time()-t_ws:.1f}s")
@@ -1037,6 +880,9 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
     return elig[mask], t
 
 
+# =====================================================================
+# Driver
+# =====================================================================
 def main(cfg):
     t0 = time.time()
     caps, elig, user_groups, group_ratios = load_inputs(
@@ -1047,41 +893,43 @@ def main(cfg):
     print(f"groups: {len(group_ratios):,}   users with groups: {len(user_groups):,}")
 
     df = None; t_used = 0.0
-    # Greedy-only mode: skip ILP solvers entirely
-    if cfg.solver == "greedy":
-        print("→ Greedy only mode")
-        group_ratios_for_greedy = None
-        if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
-            group_ratios_for_greedy = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
-        df = greedy(caps, elig, cfg.k, cfg.rng, group_ratios=group_ratios_for_greedy, timeout=cfg.timeout)
-        label = "Greedy"
-        print_summary(df, caps, elig, cfg.k, label, t_used)
-        df.to_csv(cfg.out, index=False)
-        print(f"✅ wrote {cfg.out}   (total wall time {time.time()-t0:.1f}s)")
-        return
+    label = "Greedy"
+
     if cfg.solver in ("pulp", "both"):
         df, t_used = ilp_pulp(caps, elig, cfg.k, cfg.timeout, cfg.cov_w)
+        label = "PuLP"
 
     if (df is None or df.empty) and (cfg.solver in ("or", "both")):
         df, t_used = ilp_ortools(
             caps, elig, cfg.k, cfg.timeout,
             cfg.or_workers, cfg.or_log,
             cfg.cov_mode, cfg.cov_w, cfg.shortfall_penalty,
-            cfg.warm_start
+            cfg.warm_start,
+            cfg.scarcity_alpha  # pass α to warm-start greedy
         )
+        label = "OR-Tools"
 
-    if df is None or df.empty:
-        print("→ Greedy fallback")
-        # Get group ratios for greedy fallback
+    if df is None or df.empty or (cfg.solver == "greedy"):
+        print("→ Greedy mode")
         group_ratios_for_greedy = None
         if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
             group_ratios_for_greedy = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
-        
-        # Use full CLI timeout for greedy fallback
-        df = greedy(caps, elig, cfg.k, cfg.rng, group_ratios=group_ratios_for_greedy, timeout=cfg.timeout)
+        df = greedy(
+            caps, elig, cfg.k, cfg.rng,
+            group_ratios=group_ratios_for_greedy, timeout=cfg.timeout,
+            cache_factor=cfg.cache_factor,
+            mix_tail=cfg.mix_tail,
+            sponsored_first_rounds=cfg.sponsored_first_rounds,
+            third_slot_only_mixing=cfg.third_slot_only_mixing,
+            enforce_assignment_ratio=cfg.enforce_assignment_ratio,
+            assignment_ratio_guard=cfg.assignment_ratio_guard,
+            ratio_slack=cfg.ratio_slack,
+            unspon_overflow_pct=cfg.unspon_overflow_pct,
+            max_sponsored_ratio=cfg.max_sponsored_ratio,
+            max_mixed_share=cfg.max_mixed_share,
+            scarcity_alpha=cfg.scarcity_alpha
+        )
         label = "Greedy"
-    else:
-        label = "PuLP" if cfg.solver == "pulp" or (cfg.solver == "both" and t_used > 0 and df is not None) else "OR-Tools"
 
     print_summary(df, caps, elig, cfg.k, label, t_used)
     df.to_csv(cfg.out, index=False)
@@ -1095,26 +943,42 @@ def cli():
     ap.add_argument("--user_groups", required=True)
     ap.add_argument("--group_ratios", required=True)
     ap.add_argument("--out", required=True)
+
     ap.add_argument("-k", type=int, default=3, help="offers per user")
     ap.add_argument("--top_n", type=int, default=0, help="pre-trim per user (0=off)")
     ap.add_argument("--unsponsored_cap", type=int, default=10_000)
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--rng", type=int, default=42)
-    ap.add_argument("--solver", choices=("both", "pulp", "or", "greedy"), default="both")
+    ap.add_argument("--solver", choices=("both","pulp","or","greedy"), default="both")
+
+    # OR-Tools / PuLP coverage knobs (preserved)
     ap.add_argument("--or_workers", type=int, default=8)
     ap.add_argument("--or_log", action="store_true")
-    ap.add_argument("--cov_w", default="0.0003,0.0006,0.001",
-                    help="coverage weights for 1st,2nd,3rd offers per user (z mode)")
-    ap.add_argument("--cov_mode", choices=("z", "shortfall"), default="z",
-                    help="z=classic z_{u,t} coverage; shortfall=penalize missing offers")
-    ap.add_argument("--shortfall_penalty", type=float, default=0.1,
-                    help="penalty per missing offer (shortfall mode)")
-    ap.add_argument("--min_score", type=float, default=None,
-                    help="optional filter: drop elig rows with score < min_score")
-    ap.add_argument("--warm_start", dest="warm_start", action="store_true", default=True,
-                    help="use greedy to AddHint to CP-SAT (default)")
-    ap.add_argument("--no_warm_start", dest="warm_start", action="store_false",
-                    help="disable warm start")
+    ap.add_argument("--cov_w", default="0.0003,0.0006,0.001", help="coverage weights for 1st,2nd,3rd offers per user (z mode)")
+    ap.add_argument("--cov_mode", choices=("z", "shortfall"), default="z", help="z=classic z_{u,t} coverage; shortfall=penalize missing offers")
+    ap.add_argument("--shortfall_penalty", type=float, default=0.1, help="penalty per missing offer (shortfall mode)")
+    ap.add_argument("--warm_start", dest="warm_start", action="store_true", default=True, help="use greedy to AddHint to CP-SAT (default)")
+    ap.add_argument("--no_warm_start", dest="warm_start", action="store_false", help="disable warm start")
+
+    # Greedy coverage / policy knobs (new + preserved)
+    ap.add_argument("--cache_factor", type=int, default=10, help="per-user cached candidates per type = k * cache_factor")
+    ap.add_argument("--mix_tail", action="store_true", help="allow mixing types for coverage (third slot only by default)")
+    ap.add_argument("--sponsored_first_rounds", type=int, default=2, help="number of sponsored slots required before unsponsored fallback is allowed")
+    ap.add_argument("--third_slot_only_mixing", action="store_true", default=True, help="restrict mixing to 3rd slot only")
+    ap.add_argument("--max_sponsored_ratio", type=float, default=None, help="max share of users per group that may be counted as sponsored (user-level)")
+    ap.add_argument("--max_mixed_share", type=float, default=1.0, help="max share of users that may be mixed within each group (0..1)")
+
+    # Assignment-level ratio guard (new)
+    ap.add_argument("--enforce_assignment_ratio", action="store_true", help="enforce assignment-level sponsorship ratios per group")
+    ap.add_argument("--assignment_ratio_guard", choices=("none","moving","hard"), default="hard",
+                    help="unsponsored guard type: hard=no below-target placements; moving=proportional budget; none=off")
+    ap.add_argument("--ratio_slack", type=float, default=0.0, help="absolute slack for ratio guard (e.g., 0.002 allows -0.2pp)")
+    ap.add_argument("--unspon_overflow_pct", type=float, default=0.0, help="(legacy) extra unsponsored fraction when using moving guard")
+
+    # NEW: scarcity weighting parameter
+    ap.add_argument("--scarcity_alpha", type=float, default=0.0, help="sponsored scarcity weighting α (0..~0.2). 0 disables the feature.")
+
+    ap.add_argument("--min_score", type=float, default=None, help="optional filter: drop elig rows with score < min_score")
     cfg = ap.parse_args()
     try:
         main(cfg)
