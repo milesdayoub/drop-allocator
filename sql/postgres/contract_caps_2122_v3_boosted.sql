@@ -1,7 +1,7 @@
 /* ─── Timed Drop 2122 ── window: 2025-08-14 15:00 → 2025-08-15 07:00 UTC ── */
 /* Knobs (global defaults; per-contract overrides come below):
-   - z: one-sided z for Wilson UCB on new-coupon redemption (lower → higher caps)
-   - floor_r: floor redemption for new coupons
+   - z: one-sided z for Wilson UCB on new-claim redemption (lower → higher caps)
+- floor_r: floor redemption for new claims
    - overage_mult: default sponsored overage (1.0 = off)
 */
 
@@ -95,7 +95,7 @@ redeem_rates AS (
          THEN 0.20::numeric
          ELSE (h.redeems_180d + 1.0)::numeric / (h.assigns_180d + 2.0)
     END AS p_point,
-    /* One-sided Wilson UCB for NEW coupons (using params.z), floored later */
+    /* One-sided Wilson UCB for NEW claims (using params.z), floored later */
     CASE WHEN COALESCE(h.assigns_180d,0) = 0
          THEN 0.25::numeric
          ELSE LEAST(

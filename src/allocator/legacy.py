@@ -143,7 +143,7 @@ def ilp_pulp(caps, elig, k, timeout, cbc_verbose=False):
         return None, 0.0
     t0 = time.time()
 
-    prob = pulp.LpProblem("drop", pulp.LpMaximize)
+    prob = pulp.LpProblem("claim", pulp.LpMaximize)
     x = pulp.LpVariable.dicts("x", elig.index, cat="Binary")
     # objective
     prob += pulp.lpSum(elig.loc[i, 'score'] * x[i] for i in elig.index)

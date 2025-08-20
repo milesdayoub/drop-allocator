@@ -35,8 +35,16 @@ Suggested knobs for your last run:
 """
 
 from __future__ import annotations
-import argparse, sys, time, textwrap, math
+import argparse, sys, time, textwrap, math, logging
 import pandas as pd, numpy as np
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Optional solvers
 try:
@@ -106,9 +114,9 @@ def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsor
         raise ValueError(f"elig missing {m}")
 
     # CRITICAL: Filter to only users with groups
-    print(f"Before user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
+    logger.info(f"Before user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
     elig = elig[elig.user_id.isin(user_groups.user_id)]
-    print(f"After user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
+    logger.info(f"After user filtering: {len(elig):,} elig pairs, {elig['user_id'].nunique():,} unique users")
     
     # Keep only contracts with positive cap after synthetic fill
     elig = elig[elig.contract_address.isin(caps.contract_address)]
@@ -150,7 +158,7 @@ def summarize(df_assign: pd.DataFrame, elig: pd.DataFrame, k: int):
 
 def analyze_sponsored_capacity(df_assign, caps):
     """Analyze sponsored contract capacity utilization"""
-    print("\n=== SPONSORSHIP CAPACITY ANALYSIS ===")
+    logger.info("=== SPONSORSHIP CAPACITY ANALYSIS ===")
     
     # Get contract caps for sponsored contracts
     sponsored_caps = caps[caps['is_sponsored'] == True]
@@ -170,42 +178,42 @@ def analyze_sponsored_capacity(df_assign, caps):
     capacity_analysis['utilization_pct'] = (capacity_analysis['assigned'] / capacity_analysis['cap_face'] * 100).round(1)
     capacity_analysis['remaining'] = capacity_analysis['cap_face'] - capacity_analysis['assigned']
     
-    print(f"Total sponsored contract capacity: {total_sponsored_cap:,}")
-    print(f"Total sponsored assignments made: {len(sponsored_assignments):,}")
+    logger.info(f"Total sponsored contract capacity: {total_sponsored_cap:,}")
+    logger.info(f"Total sponsored assignments made: {len(sponsored_assignments):,}")
     if total_sponsored_cap > 0:
-        print(f"Overall sponsored capacity utilization: {len(sponsored_assignments)/total_sponsored_cap*100:.1f}%\n")
+        logger.info(f"Overall sponsored capacity utilization: {len(sponsored_assignments)/total_sponsored_cap*100:.1f}%")
     
     # Show contracts that are fully utilized
     fully_utilized = capacity_analysis[capacity_analysis['assigned'] >= capacity_analysis['cap_face']]
     if not fully_utilized.empty:
-        print(f"🚨 FULLY UTILIZED sponsored contracts ({len(fully_utilized)}):")
-        print(fully_utilized[['contract_address', 'cap_face', 'assigned', 'utilization_pct']].head(10))
+        logger.warning(f"🚨 FULLY UTILIZED sponsored contracts ({len(fully_utilized)}):")
+        logger.info(fully_utilized[['contract_address', 'cap_face', 'assigned', 'utilization_pct']].head(10).to_string())
     
     # Show contracts with remaining capacity
     remaining_capacity = capacity_analysis[capacity_analysis['remaining'] > 0]
     if not remaining_capacity.empty:
-        print(f"\n✅ Sponsored contracts with remaining capacity ({len(remaining_capacity)}):")
-        print(remaining_capacity[['contract_address', 'cap_face', 'assigned', 'remaining', 'utilization_pct']].head(10))
+        logger.info(f"✅ Sponsored contracts with remaining capacity ({len(remaining_capacity)}):")
+        logger.info(remaining_capacity[['contract_address', 'cap_face', 'assigned', 'remaining', 'utilization_pct']].head(10).to_string())
     
     # Show contracts with no assignments
     unused = capacity_analysis[capacity_analysis['assigned'] == 0]
     if not unused.empty:
-        print(f"\n⚠️  Unused sponsored contracts ({len(unused)}):")
-        print(unused[['contract_address', 'cap_face']].head(10))
+        logger.warning(f"⚠️  Unused sponsored contracts ({len(unused)}):")
+        logger.info(unused[['contract_address', 'cap_face']].head(10).to_string())
     
     # Summary
-    print("\n=== CAPACITY SUMMARY ===")
-    print(f"Fully utilized: {len(fully_utilized)} contracts")
-    print(f"Partially used: {len(remaining_capacity)} contracts") 
-    print(f"Unused: {len(unused)} contracts")
-    print(f"Total sponsored contracts: {len(sponsored_caps)}")
+    logger.info("=== CAPACITY SUMMARY ===")
+    logger.info(f"Fully utilized: {len(fully_utilized)} contracts")
+    logger.info(f"Partially used: {len(remaining_capacity)} contracts") 
+    logger.info(f"Unused: {len(unused)} contracts")
+    logger.info(f"Total sponsored contracts: {len(sponsored_caps)}")
 
 
 def validate_sponsorship_ratios(df_assign, elig, group_ratios, caps=None):
     if df_assign.empty:
         return
     
-    print("\n=== SPONSORSHIP RATIO VALIDATION ===")
+    logger.info("=== SPONSORSHIP RATIO VALIDATION ===")
     
     # Merge to get group and sponsorship info
     df = df_assign.merge(
@@ -219,10 +227,10 @@ def validate_sponsorship_ratios(df_assign, elig, group_ratios, caps=None):
     per_user = df.groupby('user_id')['is_sponsored'].agg(['nunique', 'first'])
     mixed_users = per_user[per_user['nunique'] > 1]
     if not mixed_users.empty:
-        print(f"❌ VIOLATION: {len(mixed_users)} users have mixed sponsorship types!")
-        print(mixed_users.head())
+        logger.error(f"❌ VIOLATION: {len(mixed_users)} users have mixed sponsorship types!")
+        logger.info(mixed_users.head().to_string())
     else:
-        print("✅ All users have uniform sponsorship types")
+        logger.info("✅ All users have uniform sponsorship types")
     
     # 2) Group-level ratios at USER level (not assignment rows)
     user_flag = (
@@ -249,10 +257,10 @@ def validate_sponsorship_ratios(df_assign, elig, group_ratios, caps=None):
     
     violations = group_stats[group_stats['ratio_violation']]
     if not violations.empty:
-        print(f"❌ USER-RATIO VIOLATIONS in {len(violations)} groups:")
-        print(violations[['total_users', 'sponsored_users', 'expected_min_sponsored', 'sponsorship_ratio', 'actual_ratio']])
+        logger.error(f"❌ USER-RATIO VIOLATIONS in {len(violations)} groups:")
+        logger.info(violations[['total_users', 'sponsored_users', 'expected_min_sponsored', 'sponsorship_ratio', 'actual_ratio']].to_string())
     else:
-        print("✅ All groups respect sponsorship ratio constraints")
+        logger.info("✅ All groups respect sponsorship ratio constraints")
     
     # 3) Assignment-level ratios (sponsored assignments / total assignments) per group
     df['_spon'] = df['is_sponsored'].astype(bool)
@@ -265,14 +273,14 @@ def validate_sponsorship_ratios(df_assign, elig, group_ratios, caps=None):
     assign_summary = assign_summary.merge(ratios, on='group_id', how='left')
     assign_summary['assignment_ratio'] = assign_summary['sponsored_assignments'] / assign_summary['total_assignments'].clip(lower=1)
 
-    print("\nAssignments-Level Summary:")
-    print(assign_summary[['total_assignments', 'sponsored_assignments', 'sponsorship_ratio', 'assignment_ratio']].round(3))
+    logger.info("Assignments-Level Summary:")
+    logger.info(assign_summary[['total_assignments', 'sponsored_assignments', 'sponsorship_ratio', 'assignment_ratio']].round(3).to_string())
 
     viol = assign_summary[assign_summary['assignment_ratio'] + 1e-12 < assign_summary['sponsorship_ratio']]
     if not viol.empty:
-        print(f"❌ ASSIGNMENT-RATIO VIOLATIONS in {len(viol):,} groups.")
+        logger.error(f"❌ ASSIGNMENT-RATIO VIOLATIONS in {len(viol):,} groups.")
     else:
-        print("✅ All groups respect assignments-level sponsorship ratios")
+        logger.info("✅ All groups respect assignments-level sponsorship ratios")
     
     # Capacity analysis if caps provided
     if caps is not None:
@@ -285,7 +293,8 @@ def print_summary(df_assign, caps, elig, k, label, t_sec):
     cap_viol = used[used > cap]
     stats = summarize(df_assign, elig, k)
     obj = df_assign['score'].sum() if 'score' in df_assign.columns and not df_assign.empty else float('nan')
-    print(textwrap.dedent(f"""
+    
+    summary_text = textwrap.dedent(f"""
         ── {label} summary ───────────────────────────────────────
         users (elig)      : {stats['n_users']:,}
         assignments       : {len(df_assign):,}
@@ -295,7 +304,10 @@ def print_summary(df_assign, caps, elig, k, label, t_sec):
         cap violations    : {'0' if cap_viol.empty else cap_viol.to_dict()}
         wall time         : {t_sec:.1f}s
         ──────────────────────────────────────────────────────────
-    """).strip())
+    """).strip()
+    
+    logger.info(summary_text)
+    
     if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
         group_ratios = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
         validate_sponsorship_ratios(df_assign, elig, group_ratios, caps)
@@ -317,7 +329,7 @@ def greedy(
 ):
     start_time = time.time()
     rng = np.random.default_rng(seed)
-    print(f"[greedy] Pre-processing data for {len(elig):,} elig pairs...")
+    logger.info(f"[greedy] Pre-processing data for {len(elig):,} elig pairs...")
 
     # Remaining capacity per contract
     remaining = caps.set_index('contract_address').cap_face.to_dict()
@@ -501,7 +513,7 @@ def greedy(
 
     # ── Phase 1: meet user-level sponsorship minima (make enough users 'sponsored-type')
     if group_ratios is not None:
-        print(f"[greedy] Phase 1: Meeting sponsorship minima for {len(group_ratios)} groups")
+        logger.info(f"[greedy] Phase 1: Meeting sponsorship minima for {len(group_ratios)} groups")
         group_targets = {row['group_id']: int(math.ceil(gid_usercnt[row['group_id']] * float(row['sponsorship_ratio'])))
                          for _, row in group_ratios.iterrows()}
         for gid, target in sorted(group_targets.items(), key=lambda kv: kv[1], reverse=True):
@@ -524,7 +536,7 @@ def greedy(
                         break
 
     # ── Phase 2: round-robin top-up to k offers (respect type; allow only 3rd-slot mixing)
-    print(f"[greedy] Phase 2: Round-robin top-up to {k} offers")
+    logger.info(f"[greedy] Phase 2: Round-robin top-up to {k} offers")
     all_users = list(elig['user_id'].unique())
     for round_idx in range(1, k+1):
         made_progress = False
@@ -564,7 +576,7 @@ def greedy(
             break
 
     # ── Sponsored sweep: drain remaining sponsored capacity toward under-filled users
-    print("[greedy] Sponsored sweep (pressure-first)")
+            logger.info("[greedy] Sponsored sweep (pressure-first)")
     spon_contracts = [ca for ca in remaining if c_is_spon.get(ca, False) and remaining[ca] > 0]
     spon_contracts.sort(key=lambda ca: remaining[ca], reverse=True)
     for ca in spon_contracts:
@@ -579,7 +591,7 @@ def greedy(
             if remaining[ca] <= 0: break
 
     # ── Conversion sweep: turn fully-unsponsored users into sponsored when possible
-    print("[greedy] Conversion sweep (unsponsored → sponsored where possible)")
+            logger.info("[greedy] Conversion sweep (unsponsored → sponsored where possible)")
     unspon_users = [u for u, t in user_sponsorship.items() if t is False and user_assigned_count.get(u,0) > 0]
     unspon_users.sort(key=lambda u: user_assigned_count.get(u,0))
     for uid in unspon_users:
@@ -615,7 +627,7 @@ def greedy(
             user_sponsorship[uid] = True  # converted
 
     # ── Unsponsored sweep: place unsponsored for users below k (respect guards)
-    print("[greedy] Unsponsored sweep (pressure-first)")
+            logger.info("[greedy] Unsponsored sweep (pressure-first)")
     unspon_contracts = [ca for ca in remaining if not c_is_spon.get(ca, False) and remaining[ca] > 0]
     unspon_contracts.sort(key=lambda ca: remaining[ca], reverse=True)
     for ca in unspon_contracts:
@@ -630,7 +642,7 @@ def greedy(
             if remaining[ca] <= 0: break
 
     # ── Coverage sweep: fill to k; prefer sponsored; third-slot unspon only if allowed & guard passes
-    print("[greedy] Coverage sweep (fill to k; mixed types allowed)")
+            logger.info("[greedy] Coverage sweep (fill to k; mixed types allowed)")
     all_users = list(elig['user_id'].unique())
     underfilled = [u for u in all_users if user_assigned_count.get(u,0) < k]
     for uid in underfilled:
@@ -661,7 +673,7 @@ def greedy(
         result_df = elig.loc[mask].copy()
 
     elapsed = time.time() - start_time
-    print(f"[greedy] Completed: {len(assigned_pairs):,} assignments, {len(set([u for (u, _) in assigned_pairs])):,} users in {elapsed:.1f}s")
+    logger.info(f"[greedy] Completed: {len(assigned_pairs):,} assignments, {len(set([u for (u, _) in assigned_pairs])):,} users in {elapsed:.1f}s")
     return result_df
 
 
@@ -732,7 +744,7 @@ def ilp_pulp(caps, elig, k, timeout, cov_w_str):
     t = time.time() - t0
     status = pulp.LpStatus.get(prob.status, "Unknown")
     obj = float(pulp.value(prob.objective)) if status in ("Optimal", "Feasible") else float('nan')
-    print(f"→ PuLP  ILP ……status={status}  time={t:.1f}s  objective={obj:.6f}")
+    logger.info(f"→ PuLP  ILP ……status={status}  time={t:.1f}s  objective={obj:.6f}")
     if status not in ("Optimal", "Feasible"): return None, t
 
     pick = [i for i in elig.index if x[i].value() > 0.5]
@@ -741,19 +753,19 @@ def ilp_pulp(caps, elig, k, timeout, cov_w_str):
 
 def _add_hint_compat(model, x_vars, hint_idx):
     if len(hint_idx) == 0:
-        print("[warm-start] no hint rows"); return
+        logger.info("[warm-start] no hint rows"); return
     try:
         model.AddHint([x_vars[i] for i in hint_idx], [1] * len(hint_idx))
-        print(f"[warm-start] hinted {len(hint_idx):,} vars via AddHint()")
+        logger.info(f"[warm-start] hinted {len(hint_idx):,} vars via AddHint()")
         return
     except Exception as e1:
         try:
             proto = model._CpModel__model
             proto.solution_hint.vars.extend([x_vars[i].Index() for i in hint_idx])
             proto.solution_hint.values.extend([1] * len(hint_idx))
-            print(f"[warm-start] hinted {len(hint_idx):,} vars via proto")
+            logger.info(f"[warm-start] hinted {len(hint_idx):,} vars via proto")
         except Exception as e2:
-            print(f"[warm-start] failed to add hints: {e1} / {e2} → continuing without hints")
+            logger.warning(f"[warm-start] failed to add hints: {e1} / {e2} → continuing without hints")
 
 
 def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str, shortfall_penalty, warm_start, scarcity_alpha_ws: float = 0.0):
@@ -761,7 +773,7 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
         reason = []
         if not HAVE_OR: reason.append("HAVE_OR=False")
         if len(elig) > MAX_CP_SAT_VARS: reason.append(f"len(elig)={len(elig):,} > {MAX_CP_SAT_VARS:,}")
-        print("→ Skipping OR-Tools:", "; ".join(reason))
+        logger.warning("→ Skipping OR-Tools:", "; ".join(reason))
         return None, 0.0
 
     t0 = time.time()
@@ -820,7 +832,7 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
             group_size = len(group_user_cats)
             min_sponsored = int(math.ceil(group_size * ratio))
             m.Add(LSum([y_user[uc] for uc in group_user_cats]) >= min_sponsored)
-            print(f"Group {group_id}: {group_size} users, ratio={ratio:.2f}, min_sponsored={min_sponsored}")
+            logger.info(f"Group {group_id}: {group_size} users, ratio={ratio:.2f}, min_sponsored={min_sponsored}")
 
     for uc, idx in idx_by_user.items():
         m.Add(LSum([x[i] for i in idx]) >= y_user[uc])
@@ -866,13 +878,13 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
         g = greedy(caps, elig, k, seed=42, group_ratios=group_ratios_for_greedy, timeout=150, scarcity_alpha=scarcity_alpha_ws)
         hint_idx = _hint_indices_from_greedy(elig, g)
         _add_hint_compat(m, x, hint_idx)
-        print(f"[warm-start] built in {time.time()-t_ws:.1f}s")
+        logger.info(f"[warm-start] built in {time.time()-t_ws:.1f}s")
 
     status = solver.Solve(m)
     t = time.time() - t0
     status_str = {cp_model.OPTIMAL: "OPTIMAL", cp_model.FEASIBLE: "FEASIBLE"}.get(status, str(status))
     obj = solver.ObjectiveValue() / 1_000_000.0 if status in (cp_model.OPTIMAL, cp_model.FEASIBLE) else float('nan')
-    print(f"→ OR-Tools ILP …status={status_str}  time={t:.1f}s  objective={obj:.6f}")
+    logger.info(f"→ OR-Tools ILP …status={status_str}  time={t:.1f}s  objective={obj:.6f}")
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None, t
 
@@ -889,8 +901,8 @@ def main(cfg):
         cfg.caps, cfg.elig, cfg.user_groups, cfg.group_ratios, 
         cfg.unsponsored_cap, cfg.top_n, cfg.min_score
     )
-    print(f"caps: {len(caps):,}   elig pairs: {len(elig):,}")
-    print(f"groups: {len(group_ratios):,}   users with groups: {len(user_groups):,}")
+    logger.info(f"caps: {len(caps):,}   elig pairs: {len(elig):,}")
+    logger.info(f"groups: {len(group_ratios):,}   users with groups: {len(user_groups):,}")
 
     df = None; t_used = 0.0
     label = "Greedy"
@@ -910,7 +922,7 @@ def main(cfg):
         label = "OR-Tools"
 
     if df is None or df.empty or (cfg.solver == "greedy"):
-        print("→ Greedy mode")
+        logger.info("→ Greedy mode")
         group_ratios_for_greedy = None
         if 'group_id' in elig.columns and 'sponsorship_ratio' in elig.columns:
             group_ratios_for_greedy = elig.groupby('group_id')['sponsorship_ratio'].first().reset_index()
@@ -933,7 +945,7 @@ def main(cfg):
 
     print_summary(df, caps, elig, cfg.k, label, t_used)
     df.to_csv(cfg.out, index=False)
-    print(f"✅ wrote {cfg.out}   (total wall time {time.time()-t0:.1f}s)")
+    logger.info(f"✅ wrote {cfg.out}   (total wall time {time.time()-t0:.1f}s)")
 
 
 def cli():
@@ -979,11 +991,16 @@ def cli():
     ap.add_argument("--scarcity_alpha", type=float, default=0.0, help="sponsored scarcity weighting α (0..~0.2). 0 disables the feature.")
 
     ap.add_argument("--min_score", type=float, default=None, help="optional filter: drop elig rows with score < min_score")
+    ap.add_argument("--log_level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO", help="logging level")
     cfg = ap.parse_args()
+    
+    # Set log level from command line
+    logging.getLogger().setLevel(getattr(logging, cfg.log_level))
+    
     try:
         main(cfg)
     except Exception as e:
-        print("ERROR:", e, file=sys.stderr); sys.exit(1)
+        logger.error(f"ERROR: {e}"); sys.exit(1)
 
 
 if __name__ == "__main__":

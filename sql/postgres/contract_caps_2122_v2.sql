@@ -2,7 +2,7 @@
    Inputs you can tweak:
      :win_start, :win_end        → drop visibility window
      :history_days               → lookback window for redemption history
-     :z                          → one-sided Wilson z (risk knob for NEW coupons)
+     :z                          → one-sided Wilson z (risk knob for NEW claims)
      :floor_r                    → minimum assumed redemption (safety floor)
      :overage_mult               → sponsored budget overage multiplier
 -------------------------------------------------------------------------------*/
@@ -72,7 +72,7 @@ rates AS (  -- point estimate & Wilson upper bound + floors
     h.redeems_n,
     -- Laplace point estimate for EXPECTED redemption (used for outstanding reserve)
     COALESCE( (h.redeems_n + 1.0) / NULLIF(h.assigns_n + 2.0, 0), 0.10 )    AS r_point_raw,  -- 0.10 fallback if no history
-    -- Wilson one-sided upper bound (add-2 smoothed form) for NEW coupon risk
+    -- Wilson one-sided upper bound (add-2 smoothed form) for NEW claim risk
     LEAST(
       1.0,
       (h.redeems_n + 1.0) / (h.assigns_n + 2.0)
@@ -98,7 +98,7 @@ SELECT
   -- redemption knobs actually used
   GREATEST(COALESCE(r.r_point_raw, 0.10), p.floor_r)                       AS r_outstanding_used,  -- expected for existing claims
   GREATEST(COALESCE(r.r_upper_raw, 0.97), p.floor_r)                       AS r_newcoupon_used,    -- upper bound for new issues
-  -- SAFE capacity (new coupons we can still print)
+-- SAFE capacity (new claims we can still print)
   FLOOR(
     GREATEST(
       (CASE WHEN s.is_sponsored THEN s.budget_total * p.overage_mult ELSE s.budget_total END)

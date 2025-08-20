@@ -25,7 +25,7 @@ spent AS (                         -- dollars already paid
       AND  contract_address IN (SELECT contract_address FROM scope)
     GROUP  BY 1
 ),
-outstanding AS (                   -- live, unredeemed coupons
+outstanding AS (                   -- live, unredeemed claims
     SELECT contract_address,
            COUNT(*) AS coupons_live
     FROM   contract_assignment
@@ -66,7 +66,7 @@ SELECT
                           / ((h.assigns_180d + 2.0)^2*(h.assigns_180d + 3.0)) )
         )
     END                                               AS p_upper,
-    /* safe amount of new coupons we can still print */
+    /* safe amount of new claims we can still print */
     FLOOR(
       GREATEST(c.budget - COALESCE(sp.dollars_spent,0)
                - COALESCE(o.coupons_live,0)*s.face_value, 0)

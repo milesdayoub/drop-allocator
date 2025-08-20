@@ -1,0 +1,5 @@
+# --- requirements.txt ---
+pandas>=2.2.0
+numpy>=1.26
+ortools>=9.9          # ILP solver ❶  (≈ 20 MB wheel, no C++ build!)
+pulp>=2.8             # fallback solver ❷

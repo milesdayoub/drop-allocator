@@ -153,7 +153,7 @@ def ilp_pulp(caps, elig, k, timeout, cov_w_str):
     t0 = time.time()
 
     cov_w = _parse_cov_w(cov_w_str, k)  # e.g., [0.0003,0.0006,0.001]
-    prob = pulp.LpProblem("drop", pulp.LpMaximize)
+    prob = pulp.LpProblem("claim", pulp.LpMaximize)
 
     x = {i: pulp.LpVariable(f"x_{i}", cat="Binary") for i in elig.index}
 
