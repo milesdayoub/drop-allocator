@@ -125,6 +125,15 @@ def load_inputs(caps_csv, elig_csv, user_groups_csv, group_ratios_csv, unsponsor
     if min_score is not None:
         elig = elig[elig['score'] >= float(min_score)]
 
+    # Optional: pre-trim per user to top-N contracts by score
+    if top_n is not None and int(top_n) > 0:
+        elig = (
+            elig.sort_values(['user_id', 'score'], ascending=[True, False])
+                .groupby('user_id', group_keys=False)
+                .head(int(top_n))
+                .reset_index(drop=True)
+        )
+
     # Add contract sponsorship information
     caps_spon = caps[['contract_address', 'is_sponsored']].copy()
     elig = elig.merge(caps_spon, on='contract_address', how='left')
@@ -538,6 +547,9 @@ def greedy(
     # ── Phase 2: round-robin top-up to k offers (respect type; allow only 3rd-slot mixing)
     logger.info(f"[greedy] Phase 2: Round-robin top-up to {k} offers")
     all_users = list(elig['user_id'].unique())
+    # Shuffle user order to avoid systematic bias and use provided seed
+    if len(all_users) > 1:
+        all_users = list(rng.permutation(all_users))
     for round_idx in range(1, k+1):
         made_progress = False
         for uid in all_users:
@@ -773,7 +785,7 @@ def ilp_ortools(caps, elig, k, timeout, or_workers, or_log, cov_mode, cov_w_str,
         reason = []
         if not HAVE_OR: reason.append("HAVE_OR=False")
         if len(elig) > MAX_CP_SAT_VARS: reason.append(f"len(elig)={len(elig):,} > {MAX_CP_SAT_VARS:,}")
-        logger.warning("→ Skipping OR-Tools:", "; ".join(reason))
+        logger.warning("→ Skipping OR-Tools: %s", "; ".join(reason))
         return None, 0.0
 
     t0 = time.time()
@@ -999,8 +1011,9 @@ def cli():
     
     try:
         main(cfg)
-    except Exception as e:
-        logger.error(f"ERROR: {e}"); sys.exit(1)
+    except Exception:
+        logger.exception("Unhandled error during allocation run")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
