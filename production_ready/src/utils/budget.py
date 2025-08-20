@@ -1,5 +1,7 @@
 
-import pandas as pd
+import pandas as pd, logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 caps = pd.read_csv("contract_caps_2121.csv")
 S = caps.loc[caps.sponsored==True, "cap"].sum()         # total sponsored capacity
 U = 188_006                                             # users in this drop
@@ -7,4 +9,4 @@ k = 3
 unsponsored_needed_min = max(0, U*k - S)                # if we fully use sponsored
 unsponsored_cap = 370_000
 feasible = unsponsored_needed_min <= unsponsored_cap
-print(S, unsponsored_needed_min, feasible)
+logger.info("S=%s unsponsored_needed_min=%s feasible=%s", S, unsponsored_needed_min, feasible)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, sys
+import argparse, sys, logging
 import pandas as pd
 import numpy as np
 
@@ -13,7 +13,15 @@ def main():
     ap.add_argument("--elig", required=True)
     ap.add_argument("-k", type=int, default=3)
     ap.add_argument("--unsponsored_cap", type=int, default=0, help="global cap for unsponsored assignments (allocator flag)")
+    ap.add_argument("--log_level", choices=("DEBUG","INFO","WARNING","ERROR"), default="INFO")
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
     # Load caps (drop list for this run)
     caps = pd.read_csv(args.caps, dtype={'contract_address': str})
@@ -86,42 +94,40 @@ def main():
     # Global unsponsored cap check
     unspon_cap_ok = (assigned_unspon <= args.unsponsored_cap) if args.unsponsored_cap > 0 else True
 
-    # Print summary
-    print("── validator ─────────────────────────────────────────")
-    print(f"eligible users (≥1 option)     : {fmt(U)}")
-    print(f"users with ≥{args.k} options     : {fmt(users_with_ge_k_opts)}")
-    print(f"users with <{args.k} options     : {fmt(users_with_lt_k_opts)}")
-    print()
-    print("Theoretical feasibility (before solving):")
-    print(f"  sponsored cap sum (Σ cap_face, sponsored) : {fmt(S_cap)}")
-    print(f"  global unsponsored_cap (flag)             : {fmt(args.unsponsored_cap)}")
-    print(f"  total slots needed (U×k)                  : {fmt(total_needed)}")
-    print(f"  min unsponsored needed (U×k - S_cap)      : {fmt(min_unspon_needed)}")
-    print(f"  feasible by caps?                         : {'YES' if feasible_by_caps else 'NO'}")
+    # Summary
+    logger.info("── validator ─────────────────────────────────────────")
+    logger.info(f"eligible users (≥1 option)     : {fmt(U)}")
+    logger.info(f"users with ≥{args.k} options     : {fmt(users_with_ge_k_opts)}")
+    logger.info(f"users with <{args.k} options     : {fmt(users_with_lt_k_opts)}")
+    logger.info("Theoretical feasibility (before solving):")
+    logger.info(f"  sponsored cap sum (Σ cap_face, sponsored) : {fmt(S_cap)}")
+    logger.info(f"  global unsponsored_cap (flag)             : {fmt(args.unsponsored_cap)}")
+    logger.info(f"  total slots needed (U×k)                  : {fmt(total_needed)}")
+    logger.info(f"  min unsponsored needed (U×k - S_cap)      : {fmt(min_unspon_needed)}")
+    logger.info(f"  feasible by caps?                         : {'YES' if feasible_by_caps else 'NO'}")
     if not feasible_by_caps:
-        print("  → Impossible to give every eligible user k offers with current sponsored caps and unsponsored_cap.")
+        logger.warning("  → Impossible to give every eligible user k offers with current sponsored caps and unsponsored_cap.")
     if users_with_lt_k_opts:
-        print(f"  → {fmt(users_with_lt_k_opts)} users lack enough candidate contracts in the elig file (increase pair coverage).")
-    print()
-    print("Realized assignments (from allocator output):")
-    print(f"  total assignments              : {fmt(total_assigned)}")
-    print(f"  users with 3 / 2 / 1 / 0       : {fmt(n3)} / {fmt(n2)} / {fmt(n1)} / {fmt(n0)}")
-    print(f"  sponsored / unsponsored        : {fmt(assigned_spon)} / {fmt(assigned_unspon)}")
-    print(f"  unsponsored_cap respected?     : {'YES' if unspon_cap_ok else 'NO'}")
+        logger.warning(f"  → {fmt(users_with_lt_k_opts)} users lack enough candidate contracts in the elig file (increase pair coverage).")
+    logger.info("Realized assignments (from allocator output):")
+    logger.info(f"  total assignments              : {fmt(total_assigned)}")
+    logger.info(f"  users with 3 / 2 / 1 / 0       : {fmt(n3)} / {fmt(n2)} / {fmt(n1)} / {fmt(n0)}")
+    logger.info(f"  sponsored / unsponsored        : {fmt(assigned_spon)} / {fmt(assigned_unspon)}")
+    logger.info(f"  unsponsored_cap respected?     : {'YES' if unspon_cap_ok else 'NO'}")
     if not_in_caps:
-        print(f"  WARN: {fmt(not_in_caps)} assignment rows reference contracts not in caps (dropped in checks).")
+        logger.warning(f"  WARN: {fmt(not_in_caps)} assignment rows reference contracts not in caps (dropped in checks).")
     if not overages.empty:
-        print("\nOver-cap sponsored contracts:")
+        logger.info("Over-cap sponsored contracts:")
         for _, r in overages.sort_values('over_by', ascending=False).iterrows():
-            print(f"  {r.contract_address}  assigned={fmt(r.assigned)}  cap={fmt(r.cap_face)}  over_by={fmt(r.over_by)}")
-    print("───────────────────────────────────────────────────────")
+            logger.info(f"  {r.contract_address}  assigned={fmt(r.assigned)}  cap={fmt(r.cap_face)}  over_by={fmt(r.over_by)}")
+    logger.info("───────────────────────────────────────────────────────")
 
     # Optional: top reasons users lack k options
     if users_with_lt_k_opts:
         lacking['need'] = args.k - lacking['opt_total']
         buckets = lacking[['sponsored_opts','unsponsored_opts','need']].copy()
-        print("\nUsers lacking options (sample breakdown):")
-        print(buckets.head(10).to_string(index=False))
+        logger.info("Users lacking options (sample breakdown):")
+        logger.info(buckets.head(10).to_string(index=False))
 
 if __name__ == "__main__":
     pd.set_option("display.max_rows", 200)

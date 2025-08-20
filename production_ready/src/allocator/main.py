@@ -588,7 +588,7 @@ def greedy(
             break
 
     # ── Sponsored sweep: drain remaining sponsored capacity toward under-filled users
-            logger.info("[greedy] Sponsored sweep (pressure-first)")
+    logger.info("[greedy] Sponsored sweep (pressure-first)")
     spon_contracts = [ca for ca in remaining if c_is_spon.get(ca, False) and remaining[ca] > 0]
     spon_contracts.sort(key=lambda ca: remaining[ca], reverse=True)
     for ca in spon_contracts:
@@ -603,7 +603,7 @@ def greedy(
             if remaining[ca] <= 0: break
 
     # ── Conversion sweep: turn fully-unsponsored users into sponsored when possible
-            logger.info("[greedy] Conversion sweep (unsponsored → sponsored where possible)")
+    logger.info("[greedy] Conversion sweep (unsponsored → sponsored where possible)")
     unspon_users = [u for u, t in user_sponsorship.items() if t is False and user_assigned_count.get(u,0) > 0]
     unspon_users.sort(key=lambda u: user_assigned_count.get(u,0))
     for uid in unspon_users:
@@ -639,7 +639,7 @@ def greedy(
             user_sponsorship[uid] = True  # converted
 
     # ── Unsponsored sweep: place unsponsored for users below k (respect guards)
-            logger.info("[greedy] Unsponsored sweep (pressure-first)")
+    logger.info("[greedy] Unsponsored sweep (pressure-first)")
     unspon_contracts = [ca for ca in remaining if not c_is_spon.get(ca, False) and remaining[ca] > 0]
     unspon_contracts.sort(key=lambda ca: remaining[ca], reverse=True)
     for ca in unspon_contracts:
@@ -654,7 +654,7 @@ def greedy(
             if remaining[ca] <= 0: break
 
     # ── Coverage sweep: fill to k; prefer sponsored; third-slot unspon only if allowed & guard passes
-            logger.info("[greedy] Coverage sweep (fill to k; mixed types allowed)")
+    logger.info("[greedy] Coverage sweep (fill to k; mixed types allowed)")
     all_users = list(elig['user_id'].unique())
     underfilled = [u for u in all_users if user_assigned_count.get(u,0) < k]
     for uid in underfilled:

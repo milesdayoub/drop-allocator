@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, sys
+import argparse, sys, logging
 import pandas as pd, numpy as np
 
 def main():
@@ -9,7 +9,15 @@ def main():
     ap.add_argument("--elig", required=True)   # needed to compute 0-offer users
     ap.add_argument("-k", type=int, default=3)
     ap.add_argument("--top_constrained", type=int, default=15)
+    ap.add_argument("--log_level", choices=("DEBUG","INFO","WARNING","ERROR"), default="INFO")
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    logger = logging.getLogger(__name__)
 
     caps = pd.read_csv(args.caps, dtype={'contract_address': str})
     need_caps = {'contract_address','cap_face','is_sponsored'}
@@ -50,18 +58,18 @@ def main():
     constrained = per_c[(per_c['cap_face'] > 0) & ((per_c['assigned'] >= per_c['cap_face']) | (per_c['util'] >= 0.95))]
     constrained = constrained.sort_values(['util','cap_face','assigned'], ascending=[False, False, False]).head(args.top_constrained)
 
-    print("── report ─────────────────────────────")
-    print(f"assignments       : {total:,}")
-    print(f"eligible users    : {elig_users.nunique():,}")
-    print(f"offer counts      : 3→{n3:,}   2→{n2:,}   1→{n1:,}   0→{n0:,}")
-    print(f"sponsored share   : {s_share:.2f}%  ({s_assign:,}/{total:,})")
+    logger.info("── report ─────────────────────────────")
+    logger.info(f"assignments       : {total:,}")
+    logger.info(f"eligible users    : {elig_users.nunique():,}")
+    logger.info(f"offer counts      : 3→{n3:,}   2→{n2:,}   1→{n1:,}   0→{n0:,}")
+    logger.info(f"sponsored share   : {s_share:.2f}%  ({s_assign:,}/{total:,})")
     if not constrained.empty:
-        print("\nTop constrained contracts:")
+        logger.info("Top constrained contracts:")
         for _, r in constrained.iterrows():
             util = "n/a" if pd.isna(r['util']) else f"{r['util']*100:.1f}%"
-            print(f"  {r.contract_address}  sponsored={'Y' if r.is_sponsored else 'N'}  "
-                  f"assigned={int(r.assigned):>6}  cap={int(r.cap_face):>6}  util={util}")
-    print("──────────────────────────────────────")
+            logger.info(f"  {r.contract_address}  sponsored={'Y' if r.is_sponsored else 'N'}  "
+                        f"assigned={int(r.assigned):>6}  cap={int(r.cap_face):>6}  util={util}")
+    logger.info("──────────────────────────────────────")
 
 if __name__ == "__main__":
     main()
